@@ -1,0 +1,26 @@
+version: '3.9'
+services:
+  ussd-gateway:
+    build: ./ussd-gateway
+    ports:
+      - "3001:3001"
+  vas-platform:
+    build: ./vas-platform
+    ports:
+      - "3002:3002"
+  crm-service:
+    build: ./crm-service
+    ports:
+      - "3003:3003"
+  billing-service:
+    build: ./billing-service
+    ports:
+      - "3004:3004"
+  smsc-service:
+    build: ./smsc-service
+    ports:
+      - "3005:3005"
+  aggregator-service:
+    build: ./aggregator-service
+    ports:
+      - "3006:3006"
