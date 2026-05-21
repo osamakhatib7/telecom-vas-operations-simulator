@@ -17,7 +17,7 @@ Core and VAS operations engineers often need to understand how requests move bet
 This project demonstrates those ideas without pretending to be a real telecom network. It focuses on operational thinking:
 
 - How incoming events are validated.
-- How routing rules select a destination platform.
+- How a gateway or service broker selects a destination platform.
 - How failures are classified.
 - How transaction logs support troubleshooting.
 - How KPIs show service health.
@@ -28,45 +28,44 @@ This project demonstrates those ideas without pretending to be a real telecom ne
 ```text
 Test Client
   -> Core Network Mock (3007)
-    -> USSD Gateway (3001)
-      -> VAS Platform (3002)
+    -> USSD Gateway / Service Broker (3001)
+      -> VAS Platform / Business Application (3002)
         -> CRM Service (3003)
         -> Billing Service (3004)
         -> Aggregator Service (3006)
         -> SMSC Service (3005)
-        -> Mock destination platforms
 
 Mock signaling events
   -> Core Network Mock POST /simulate/signaling-event
     -> USSD Gateway POST /simulate/signaling-event
-      -> VAS Platform POST /signaling-event
-        -> Routing rules
-        -> Mock destination platform
-        -> Transaction log
-        -> KPI calculation
+      -> Routing rules
+      -> Transaction log
+      -> KPI calculation
+      -> VAS Platform POST /internal/routed-vas-event
+      -> Mock destination platforms
 ```
 
-The `core-network-mock` service is only a mock signaling source. It is not a real core network implementation. The existing VAS purchase flow still uses the CRM, Billing, Aggregator, and SMSC mock services. The signaling-event flow is handled inside the VAS platform using in-memory routing rules and transaction logs.
+The `core-network-mock` service is only a mock signaling source. It is not a real core network implementation. The USSD Gateway acts as the service broker and owns routing rules, routing decisions, signaling transaction logs, and signaling KPIs. The VAS Platform remains the business application and keeps the existing USSD purchase flow through CRM, Billing, Aggregator, and SMSC.
 
 ## Features
 
 - Core Network Mock service as the official test entry point for mock signaling events.
-- Mock USSD gateway for forwarding USSD and mock signaling traffic.
+- USSD Gateway / Service Broker for routing mock signaling traffic.
 - Existing USSD bundle purchase flow.
 - Mock CRM subscriber lookup.
 - Mock Billing balance lookup and charging.
 - Mock Aggregator activation.
 - Mock SMSC confirmation delivery.
 - Mock signaling event endpoint for Core/VAS operations scenarios.
-- In-memory routing rules.
-- In-memory transaction logs.
-- KPI endpoint for today's traffic.
+- In-memory routing rules in the USSD Gateway.
+- In-memory transaction logs in the USSD Gateway.
+- KPI endpoint for today's signaling traffic in the USSD Gateway.
 - Health endpoint with component status.
 - Failure simulation for routing, subscriber, billing, partner, and internal failures.
 
 ## Routing Rules
 
-Routing rules are stored in memory inside `vas-platform`.
+Routing rules are stored in memory inside `ussd-gateway`.
 
 | Service Type | Service Code | Destination Platform |
 |---|---|---|
@@ -99,13 +98,9 @@ Use it through port `3007`:
 POST http://127.0.0.1:3007/simulate/signaling-event
 ```
 
-This endpoint accepts a mock telecom event and forwards it to the USSD Gateway. The gateway then forwards it to:
+This endpoint accepts a mock telecom event and forwards it to the USSD Gateway. The gateway validates the event, applies routing rules, writes a transaction log, and decides the destination platform.
 
-```text
-POST /signaling-event
-```
-
-on `vas-platform`.
+When the destination is `VAS_PLATFORM`, the gateway forwards the routed event to the internal VAS endpoint `POST /internal/routed-vas-event`. Other mock destinations are simulated directly by the gateway.
 
 Example event:
 
@@ -137,7 +132,7 @@ Successful response:
 
 ## Transaction Logs
 
-The VAS platform creates an in-memory transaction log for each mock signaling event.
+The USSD Gateway creates an in-memory transaction log for each mock signaling event.
 
 Each transaction log includes:
 
@@ -175,7 +170,7 @@ GET /transactions?failureReason=BILLING_FAILED
 GET /transactions?serviceCode=*123%23
 ```
 
-Logs are in memory only and reset when the VAS platform restarts.
+Logs are in memory only and reset when the USSD Gateway restarts.
 
 ## KPI and Health Checks
 
@@ -432,25 +427,25 @@ curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
 KPI endpoint:
 
 ```bash
-curl http://127.0.0.1:3002/kpi/today
+curl http://127.0.0.1:3001/kpi/today
 ```
 
 Health endpoint:
 
 ```bash
-curl http://127.0.0.1:3002/health
+curl http://127.0.0.1:3001/health
 ```
 
 Transaction search by subscriber:
 
 ```bash
-curl "http://127.0.0.1:3002/transactions?msisdn=970599123456"
+curl "http://127.0.0.1:3001/transactions?msisdn=970599123456"
 ```
 
 Transaction search by failure reason:
 
 ```bash
-curl "http://127.0.0.1:3002/transactions?failureReason=BILLING_FAILED"
+curl "http://127.0.0.1:3001/transactions?failureReason=BILLING_FAILED"
 ```
 
 Existing USSD purchase flow:
