@@ -6,23 +6,46 @@ app.use(express.json());
 
 const startedAt = Date.now();
 
+async function checkDependencyHealth(url) {
+  try {
+    const response = await Promise.race([
+      fetch(url),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Health check timeout')), 2000)),
+    ]);
+
+    return response.ok ? 'UP' : 'DOWN';
+  } catch (error) {
+    return 'DOWN';
+  }
+}
+
 app.use((req, res, next) => {
   console.log(`[vas-platform] ${req.method} ${req.url}`);
   next();
 });
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  const [crmService, billingService, aggregatorService, smscService] = await Promise.all([
+    checkDependencyHealth('http://crm-service:3003/health'),
+    checkDependencyHealth('http://billing-service:3004/health'),
+    checkDependencyHealth('http://aggregator-service:3006/health'),
+    checkDependencyHealth('http://smsc-service:3005/health'),
+  ]);
+
+  const components = {
+    vasService: 'UP',
+    crmService,
+    billingService,
+    aggregatorService,
+    smscService,
+  };
+
+  const allDependenciesUp = Object.values(components).every(status => status === 'UP');
+
   res.json({
-    status: 'UP',
+    status: allDependenciesUp ? 'UP' : 'DEGRADED',
     service: 'vas-platform',
-    components: {
-      vasService: 'UP',
-      ussdPurchaseFlow: 'UP',
-      billingMock: 'UP',
-      crmMock: 'UP',
-      aggregatorMock: 'UP',
-      smscMock: 'UP',
-    },
+    components,
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     timestamp: new Date().toISOString(),
   });
