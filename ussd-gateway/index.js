@@ -296,16 +296,22 @@ app.post('/simulate/signaling-event', async (req, res) => {
   }
 
   if (routingRule.destinationPlatform === 'VAS_PLATFORM' && !event.simulateFailure) {
+    const vasPayload = {
+      msisdn: event.msisdn,
+      sessionId: transactionId,
+      ussdCode: event.serviceCode,
+      text: typeof event.text === 'string' ? event.text : '',
+      simulateFailure: event.simulateFailure,
+    };
+
     try {
-      const response = await fetch('http://vas-platform:3002/internal/routed-vas-event', {
+      const response = await fetch('http://vas-platform:3002/ussd', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...event,
-          transactionId,
-          destinationPlatform: routingRule.destinationPlatform,
-        }),
+        body: JSON.stringify(vasPayload),
       });
+
+      const vasResponse = await response.json();
 
       if (!response.ok) {
         const result = {
@@ -313,12 +319,30 @@ app.post('/simulate/signaling-event', async (req, res) => {
           decision: 'MOCK_PROCESSING_FAILED',
           destinationPlatform: routingRule.destinationPlatform,
           status: 'FAILED',
-          failureReason: 'PARTNER_TIMEOUT',
-          errorMessage: 'VAS platform did not accept routed event.',
+          failureReason: 'VAS_PLATFORM_ERROR',
+          errorMessage: 'VAS platform did not accept the converted USSD request.',
         };
         createTransactionLog(event, result);
-        return res.status(502).json(result);
+        return res.status(response.status).json({
+          ...result,
+          vasResponse,
+        });
       }
+
+      const result = {
+        transactionId,
+        decision: `ROUTE_TO_${routingRule.destinationPlatform}`,
+        destinationPlatform: routingRule.destinationPlatform,
+        status: 'SUCCESS',
+      };
+      createTransactionLog(event, result);
+      return res.status(response.status).json({
+        ...result,
+        sessionId: vasResponse.sessionId,
+        continueSession: vasResponse.continueSession,
+        message: vasResponse.message,
+        vasResponse,
+      });
     } catch (error) {
       const result = {
         transactionId,
@@ -326,7 +350,7 @@ app.post('/simulate/signaling-event', async (req, res) => {
         destinationPlatform: routingRule.destinationPlatform,
         status: 'FAILED',
         failureReason: 'PARTNER_TIMEOUT',
-        errorMessage: 'Failed to forward routed event to VAS platform.',
+        errorMessage: 'Failed to forward converted USSD request to VAS platform.',
       };
       createTransactionLog(event, result);
       return res.status(502).json(result);

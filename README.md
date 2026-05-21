@@ -41,11 +41,11 @@ Mock signaling events
       -> Routing rules
       -> Transaction log
       -> KPI calculation
-      -> VAS Platform POST /internal/routed-vas-event
+      -> VAS Platform POST /ussd
       -> Mock destination platforms
 ```
 
-The `core-network-mock` service is only a mock signaling source. It is not a real core network implementation. The USSD Gateway acts as the service broker and owns routing rules, routing decisions, signaling transaction logs, and signaling KPIs. The VAS Platform remains the business application and keeps the existing USSD purchase flow through CRM, Billing, Aggregator, and SMSC.
+The `core-network-mock` service is only a mock signaling source. It is not a real core network implementation. The USSD Gateway acts as the service broker and owns routing rules, routing decisions, signaling transaction logs, and signaling KPIs. When routing to `VAS_PLATFORM`, the gateway converts telecom-side event fields into the normal VAS `/ussd` request format. The VAS Platform remains the business application and only receives regular `/ussd` requests for the purchase flow through CRM, Billing, Aggregator, and SMSC.
 
 ## Features
 
@@ -100,7 +100,7 @@ POST http://127.0.0.1:3007/simulate/signaling-event
 
 This endpoint accepts a mock telecom event and forwards it to the USSD Gateway. The gateway validates the event, applies routing rules, writes a transaction log, and decides the destination platform.
 
-When the destination is `VAS_PLATFORM`, the gateway forwards the routed event to the internal VAS endpoint `POST /internal/routed-vas-event`. Other mock destinations are simulated directly by the gateway.
+When the destination is `VAS_PLATFORM`, the gateway converts the event into the VAS application request and calls `POST /ussd` on `vas-platform`. Other mock destinations are simulated directly by the gateway.
 
 Example event:
 
@@ -115,6 +115,7 @@ Example event:
   "destinationPointCode": "5678",
   "globalTitle": "970599123456",
   "visitedNetwork": "LOCAL",
+  "text": "0",
   "simulateFailure": null
 }
 ```
@@ -126,7 +127,10 @@ Successful response:
   "transactionId": "TX-10001",
   "decision": "ROUTE_TO_VAS_PLATFORM",
   "destinationPlatform": "VAS_PLATFORM",
-  "status": "SUCCESS"
+  "status": "SUCCESS",
+  "sessionId": "TX-10001",
+  "continueSession": true,
+  "message": "Welcome to VAS Platform\nYour balance is: 10.5 NIS\n1. Buy bundle\n2. Exit"
 }
 ```
 
@@ -201,7 +205,7 @@ Example response:
 }
 ```
 
-The health endpoint reports basic service and mock component status:
+The gateway health endpoint reports basic service broker component status:
 
 ```text
 GET /health
@@ -212,12 +216,13 @@ Example response:
 ```json
 {
   "status": "UP",
+  "service": "ussd-gateway",
+  "role": "USSD Gateway / Service Broker",
   "components": {
-    "vasService": "UP",
+    "gatewayService": "UP",
     "routingModule": "UP",
     "transactionLogger": "UP",
-    "billingMock": "UP",
-    "crmMock": "UP"
+    "vasPlatformConnector": "UP"
   },
   "uptimeSeconds": 123,
   "timestamp": "2026-05-21T00:00:00.000Z"
@@ -325,6 +330,7 @@ curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
     "destinationPointCode": "5678",
     "globalTitle": "970599123456",
     "visitedNetwork": "LOCAL",
+    "text": "0",
     "simulateFailure": null
   }'
 ```

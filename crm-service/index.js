@@ -21,7 +21,7 @@ app.get('/subscribers/:msisdn', (req, res) => {
     return res.status(500).json({ error: 'CRM service error' });
   }
 
-  if (msisdn === '0599123456') {
+  if (msisdn === '0599123456' || msisdn === '970599123456') {
     return res.json({ msisdn, status: 'ACTIVE' });
   }
 

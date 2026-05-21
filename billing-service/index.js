@@ -6,6 +6,7 @@ app.use(express.json());
 
 const balances = {
   '0599123456': 10.5,
+  '970599123456': 10.5,
   '0599000000': 0,
 };
 
@@ -73,6 +74,7 @@ app.post('/charge', (req, res) => {
 app.post('/reset-balances', (req, res) => {
   console.log('[billing-service] resetting balances to initial state');
   balances['0599123456'] = 10.5;
+  balances['970599123456'] = 10.5;
   balances['0599000000'] = 0;
   return res.json({ status: 'reset', balances });
 });

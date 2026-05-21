@@ -28,25 +28,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.post('/internal/routed-vas-event', (req, res) => {
-  const event = req.body;
-  console.log('[vas-platform] received routed VAS event', {
-    transactionId: event.transactionId,
-    protocol: event.protocol,
-    eventType: event.eventType,
-    msisdn: event.msisdn,
-    serviceType: event.serviceType,
-    serviceCode: event.serviceCode,
-  });
-
-  return res.json({
-    status: 'RECEIVED',
-    application: 'VAS_PLATFORM',
-    transactionId: event.transactionId,
-    message: 'Routed event received by VAS business application.',
-  });
-});
-
 app.post('/ussd', async (req, res) => {
   const { msisdn, sessionId, ussdCode, text, simulateFailure } = req.body;
   console.log('[vas-platform] received request', { sessionId, msisdn, ussdCode, text, simulateFailure });
