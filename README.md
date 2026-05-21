@@ -1,24 +1,32 @@
-# Mini Telecom VAS Lab
+# Telecom Core/VAS Operations Simulator
 
-A compact, beginner-friendly simulation of a Telecom Value-Added Services (VAS) stack implemented with small Node.js services and Docker Compose. It is designed for learning and interview demonstrations of USSD-driven flows, CRM/Billing interactions, activation via an aggregator, SMS confirmations via an SMSC, and failure/compensation scenarios.
+## Project Overview
 
----
+Telecom Core/VAS Operations Simulator is a beginner-friendly Node.js and Docker Compose lab for practicing telecom operations concepts around VAS routing, USSD flows, mock signaling events, transaction logging, KPI monitoring, health checks, and failure troubleshooting.
 
-## What this project simulates
+The project started as a Mini Telecom VAS Lab and was extended into a small Core/VAS operations simulator suitable for learning, demos, and interview discussion.
 
-- A USSD gateway that forwards simulated USSD requests.
-- A central `vas-platform` that orchestrates USSD flows and service orchestration.
-- A CRM service for subscriber status lookup.
-- A Billing service that provides balances and performs charges.
-- An Aggregator service that activates bundles on an external provider.
-- An SMSC service that sends confirmation SMS messages.
-- Failure injection controls to simulate error and timeout scenarios for testing resilience and compensation.
+## Important Note
 
----
+This project is a Core/VAS operations simulator, not a real telecom core implementation. It does not implement real SS7, SIP, SMPP, MSC, HSS, or UDM protocols. It uses mock signaling events to demonstrate routing decisions, USSD/VAS flow, transaction logging, KPI monitoring, health checks, and failure troubleshooting. HTTP endpoints are used only as a test interface to trigger simulated telecom events.
 
-## Architecture (text diagram)
+## Why This Project
 
-USSD Client (curl/PowerShell)
+Core and VAS operations engineers often need to understand how requests move between gateways, VAS platforms, billing systems, customer data systems, SMS platforms, roaming gateways, and interconnect platforms.
+
+This project demonstrates those ideas without pretending to be a real telecom network. It focuses on operational thinking:
+
+- How incoming events are validated.
+- How routing rules select a destination platform.
+- How failures are classified.
+- How transaction logs support troubleshooting.
+- How KPIs show service health.
+- How a USSD-driven VAS purchase can be traced across services.
+
+## Architecture / Flow
+
+```text
+Test Client
   -> USSD Gateway (3001)
     -> VAS Platform (3002)
       -> CRM Service (3003)
@@ -26,213 +34,424 @@ USSD Client (curl/PowerShell)
       -> Aggregator Service (3006)
       -> SMSC Service (3005)
 
-Each arrow is an HTTP call. The incoming USSD request may include a `simulateFailure` flag; `vas-platform` propagates it to downstream mock services to trigger simulated errors/timeouts.
-
----
-
-## Services and ports
-
-| Service | Purpose | Port |
-|---|---|---:|
-| ussd-gateway | Accepts simulated USSD, forwards to `vas-platform` | 3001 |
-| vas-platform | Main USSD orchestration and business logic | 3002 |
-| crm-service | Subscriber lookup (ACTIVE / SUSPENDED) | 3003 |
-| billing-service | Balance lookup, charging, and test-only balance reset | 3004 |
-| smsc-service | Mock SMSC for sending confirmation SMS | 3005 |
-| aggregator-service | Mock aggregator that activates bundles with external providers | 3006 |
-
----
-
-## Main USSD flow (summary)
-
-1. User sends USSD command (simulated via `ussd-gateway` POST `/simulate-ussd`).
-2. Gateway forwards to `vas-platform` POST `/ussd`.
-3. `vas-platform` calls CRM to verify subscriber status.
-4. `vas-platform` calls Billing to fetch balance.
-5. If `text` == "1" (Buy bundle):
-   - Check balance >= bundle price (example: 5 NIS).
-   - Call Billing `POST /charge` to deduct amount.
-   - Call Aggregator to activate the bundle.
-   - Call SMSC to send confirmation SMS.
-6. Return an appropriate USSD message to the subscriber.
-
----
-
-## CRM and Billing flow details
-
-- CRM (`GET /subscribers/:msisdn`) returns subscriber `status` (`ACTIVE`, `SUSPENDED`). If not found, returns 404.
-- Billing (`GET /balance/:msisdn`) returns the numeric balance.
-- Billing `POST /charge` deducts an amount from an in-memory balance and returns `{ status: 'CHARGED', newBalance }` or a 400 for insufficient funds.
-- For testing convenience, Billing exposes `POST /reset-balances` to restore initial balances.
-
----
-
-## Bundle purchase flow (Buy 1GB example)
-
-- The VAS price is set to 5 NIS in the code.
-- When user selects Buy (text == "1") and balance >= 5:
-  1. `vas-platform` charges via Billing `POST /charge`.
-  2. If charging succeeds, `vas-platform` calls Aggregator `POST /external-service` to provision the bundle.
-  3. After successful provisioning, `vas-platform` calls SMSC `POST /send-sms` to send confirmation.
-  4. The user receives final USSD message.
-
-Note: The system charges before the Aggregator step. Aggregator failures are logged and flagged for compensation.
-
----
-
-## Failure simulation scenarios
-
-The USSD request may include a `simulateFailure` flag. `vas-platform` propagates this flag to downstream mock services that implement simulated errors/timeouts. Example payload snippet:
-
-```json
-{ "simulateFailure": "aggregator-timeout" }
+Mock signaling events
+  -> USSD Gateway POST /simulate/signaling-event
+    -> VAS Platform POST /signaling-event
+      -> Routing rules
+      -> Mock destination platform
+      -> Transaction log
+      -> KPI counters
 ```
 
-Supported values and user-facing results:
+The existing VAS purchase flow still uses the CRM, Billing, Aggregator, and SMSC mock services. The new signaling-event flow is handled inside the VAS platform using in-memory routing rules and transaction logs.
 
-| Flag | Description | Expected USSD message |
+## Features
+
+- Mock USSD gateway for test traffic.
+- Existing USSD bundle purchase flow.
+- Mock CRM subscriber lookup.
+- Mock Billing balance lookup and charging.
+- Mock Aggregator activation.
+- Mock SMSC confirmation delivery.
+- Mock signaling event endpoint for Core/VAS operations scenarios.
+- In-memory routing rules.
+- In-memory transaction logs.
+- KPI endpoint for today's traffic.
+- Health endpoint with component status.
+- Failure simulation for routing, subscriber, billing, partner, and internal failures.
+
+## Routing Rules
+
+Routing rules are stored in memory inside `vas-platform`.
+
+| Service Type | Service Code | Destination Platform |
 |---|---|---|
-| `crm-500` | CRM returns HTTP 500 | "Service temporarily unavailable. Please try again later." |
-| `billing-timeout` | Billing does not respond (timeout) | "Unable to check or charge your balance right now. Please try again later." |
-| `billing-500` | Billing returns HTTP 500 | "Unable to check or charge your balance right now. Please try again later." |
-| `aggregator-500` | Aggregator returns HTTP 500 (post-charge) | "Bundle activation failed after charging. Your transaction has been flagged for automatic refund/reversal." |
-| `aggregator-timeout` | Aggregator times out (post-charge) | "Bundle activation failed after charging. Your transaction has been flagged for automatic refund/reversal." |
-| `smsc-down` | SMSC returns HTTP 500 | "Bundle purchase successful, but SMS confirmation could not be sent." |
-| `smsc-failed` | SMSC returns delivery FAILED | "Bundle purchase successful, but SMS confirmation could not be sent." |
+| `USSD` | `*123#` | `VAS_PLATFORM` |
+| `USSD` | `*456#` | `BUNDLE_SERVICE` |
+| `ROAMING_USSD` | `*123#` | `ROAMING_GATEWAY_MOCK` |
+| `SMS` | `DEFAULT` | `SMSC_MOCK` |
+| `VOICE` | `INTERNATIONAL` | `INTERCONNECT_GATEWAY_MOCK` |
 
----
+Each rule includes:
 
-## Compensation / Reversal explanation
+- `id`
+- `serviceType`
+- `serviceCode`
+- `destinationPlatform`
+- `isActive`
+- `priority`
 
-- Because the VAS platform charges the subscriber before contacting the Aggregator, if the Aggregator fails after charging, the system cannot guarantee provisioning.
-- These cases are logged with a `COMPENSATION_NEEDED` marker in `vas-platform` logs along with the `sessionId`.
-- In real systems, this would kick off an automated reversal/refund workflow (or manual review). This lab simulates the detection and logging; actual refund mechanics are out of scope but are documented in the logs.
+## Mock Signaling Event Endpoint
 
----
+The gateway exposes:
 
-## How to run (Docker Compose)
+```text
+POST /simulate/signaling-event
+```
 
-From the repository root, run:
+This endpoint accepts a mock telecom event and forwards it to:
+
+```text
+POST /signaling-event
+```
+
+on `vas-platform`.
+
+Example event:
+
+```json
+{
+  "protocol": "SS7-MAP-MOCK",
+  "eventType": "USSD_REQUEST",
+  "msisdn": "970599123456",
+  "serviceType": "USSD",
+  "serviceCode": "*123#",
+  "originPointCode": "1234",
+  "destinationPointCode": "5678",
+  "globalTitle": "970599123456",
+  "visitedNetwork": "LOCAL",
+  "simulateFailure": null
+}
+```
+
+Successful response:
+
+```json
+{
+  "transactionId": "TX-10001",
+  "decision": "ROUTE_TO_VAS_PLATFORM",
+  "destinationPlatform": "VAS_PLATFORM",
+  "status": "SUCCESS"
+}
+```
+
+## Transaction Logs
+
+The VAS platform creates an in-memory transaction log for each mock signaling event.
+
+Each transaction log includes:
+
+- `transactionId`
+- `msisdn`
+- `protocol`
+- `eventType`
+- `serviceType`
+- `serviceCode`
+- `destinationPlatform`
+- `status`
+- `failureReason`
+- `errorMessage`
+- `createdAt`
+
+Recent transactions are available at:
+
+```text
+GET /transactions
+```
+
+Supported filters:
+
+- `msisdn`
+- `serviceType`
+- `serviceCode`
+- `status`
+- `failureReason`
+
+Examples:
+
+```text
+GET /transactions?msisdn=970599123456
+GET /transactions?failureReason=BILLING_FAILED
+GET /transactions?serviceCode=*123%23
+```
+
+Logs are in memory only and reset when the VAS platform restarts.
+
+## KPI and Health Checks
+
+The KPI endpoint calculates today's counters from in-memory transaction logs:
+
+```text
+GET /kpi/today
+```
+
+Example response:
+
+```json
+{
+  "totalRequests": 5,
+  "successCount": 2,
+  "failedCount": 3,
+  "successRate": "40%",
+  "topFailureReason": "ROUTING_NOT_FOUND",
+  "requestsByServiceType": {
+    "USSD": 4,
+    "SMS": 1
+  },
+  "requestsByDestinationPlatform": {
+    "VAS_PLATFORM": 3,
+    "UNKNOWN": 1,
+    "SMSC_MOCK": 1
+  }
+}
+```
+
+The health endpoint reports basic service and mock component status:
+
+```text
+GET /health
+```
+
+Example response:
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "vasService": "UP",
+    "routingModule": "UP",
+    "transactionLogger": "UP",
+    "billingMock": "UP",
+    "crmMock": "UP"
+  },
+  "uptimeSeconds": 123,
+  "timestamp": "2026-05-21T00:00:00.000Z"
+}
+```
+
+## Failure Scenarios
+
+The mock signaling-event flow supports these failure scenarios:
+
+| Scenario | How to Trigger | Result |
+|---|---|---|
+| Unknown service code | Use an unmapped `serviceCode` | `ROUTING_NOT_FOUND` |
+| Subscriber not active | `simulateFailure: "SUBSCRIBER_NOT_ACTIVE"` | `FAILED` |
+| Billing failure | `simulateFailure: "BILLING_FAILED"` | `FAILED` |
+| Partner timeout | `simulateFailure: "PARTNER_TIMEOUT"` | `FAILED` |
+| Internal error | `simulateFailure: "INTERNAL_ERROR"` | `FAILED` |
+
+The existing USSD purchase flow also supports mock failures for CRM, Billing, Aggregator, and SMSC.
+
+## Troubleshooting Examples
+
+Find failed transactions:
+
+```text
+GET /transactions?status=FAILED
+```
+
+Find billing failures:
+
+```text
+GET /transactions?failureReason=BILLING_FAILED
+```
+
+Find all events for one subscriber:
+
+```text
+GET /transactions?msisdn=970599123456
+```
+
+Check whether routing is working:
+
+```text
+GET /kpi/today
+```
+
+Check platform health:
+
+```text
+GET /health
+```
+
+Look for a routing failure:
+
+```text
+failureReason = ROUTING_NOT_FOUND
+```
+
+Look for a partner issue:
+
+```text
+failureReason = PARTNER_TIMEOUT
+```
+
+## How to Run
+
+From the repository root:
 
 ```powershell
-# build and start in detached mode
 docker compose up --build -d
 ```
 
-To stop the stack:
+Stop the stack:
 
 ```powershell
 docker compose down
 ```
 
----
+Main exposed ports:
 
-## How to test (PowerShell examples)
+| Service | Port |
+|---|---:|
+| USSD Gateway | 3001 |
+| VAS Platform | 3002 |
+| CRM Service | 3003 |
+| Billing Service | 3004 |
+| SMSC Service | 3005 |
+| Aggregator Service | 3006 |
 
-Show menu / balance:
+## API Examples
 
-```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:3001/simulate-ussd -Method Post -ContentType 'application/json' -Body '{"msisdn":"0599123456","sessionId":"sess-menu","ussdCode":"*123#","text":"0"}'
-```
-
-Buy bundle (normal):
-
-```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:3001/simulate-ussd -Method Post -ContentType 'application/json' -Body '{"msisdn":"0599123456","sessionId":"sess-buy","ussdCode":"*123#","text":"1"}'
-```
-
-Simulate aggregator timeout during purchase:
-
-```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:3001/simulate-ussd -Method Post -ContentType 'application/json' -Body '{"msisdn":"0599123456","sessionId":"test-agg-timeout","ussdCode":"*123#","text":"1","simulateFailure":"aggregator-timeout"}'
-```
-
----
-
-## How to test (curl examples)
-
-Show menu / balance:
+Successful USSD signaling event:
 
 ```bash
-curl -s -X POST http://127.0.0.1:3001/simulate-ussd \
+curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
   -H "Content-Type: application/json" \
-  -d '{"msisdn":"0599123456","sessionId":"sess-menu","ussdCode":"*123#","text":"0"}'
+  -d '{
+    "protocol": "SS7-MAP-MOCK",
+    "eventType": "USSD_REQUEST",
+    "msisdn": "970599123456",
+    "serviceType": "USSD",
+    "serviceCode": "*123#",
+    "originPointCode": "1234",
+    "destinationPointCode": "5678",
+    "globalTitle": "970599123456",
+    "visitedNetwork": "LOCAL",
+    "simulateFailure": null
+  }'
 ```
 
-Buy bundle with aggregator error simulation:
+Unknown USSD code:
 
 ```bash
-curl -s -X POST http://127.0.0.1:3001/simulate-ussd \
+curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
   -H "Content-Type: application/json" \
-  -d '{"msisdn":"0599123456","sessionId":"test-agg-500","ussdCode":"*123#","text":"1","simulateFailure":"aggregator-500"}'
+  -d '{
+    "protocol": "SS7-MAP-MOCK",
+    "eventType": "USSD_REQUEST",
+    "msisdn": "970599123456",
+    "serviceType": "USSD",
+    "serviceCode": "*999#",
+    "originPointCode": "1234",
+    "destinationPointCode": "5678",
+    "globalTitle": "970599123456",
+    "visitedNetwork": "LOCAL",
+    "simulateFailure": null
+  }'
 ```
 
----
-
-## How to check logs
-
-Follow the `vas-platform` logs (recommended) and the individual service logs for details:
-
-```powershell
-# follow vas-platform logs
-docker compose logs -f vas-platform
-
-# follow ussd-gateway logs
-docker compose logs -f ussd-gateway
-```
-
-Search logs for session-specific traces (example using PowerShell):
-
-```powershell
-docker compose logs --no-color --tail 200 vas-platform | Select-String 'sess-buy' -Context 0,8
-```
-
-Look for `COMPENSATION_NEEDED` entries to find activation-after-charge failures.
-
----
-
-## Troubleshooting (like a VAS engineer)
-
-- vas-platform returns 500 / no response:
-  - Check `docker compose ps` to verify containers are running.
-  - Inspect `vas-platform` logs with `docker compose logs vas-platform`.
-  - Confirm `ussd-gateway` can reach `vas-platform` (networking in compose).
-
-- A downstream service times out:
-  - Simulated timeouts can be triggered intentionally; ensure `simulateFailure` is not set.
-  - If real timeouts occur, check resource constraints, container restarts, and port bindings.
-
-- Balance values appear changed between tests:
-  - The `billing-service` uses in-memory balances and mutates them on charge.
-  - Use `POST /reset-balances` on `billing-service` (port 3004) to restore initial values.
-
-- Containers fail to start or build errors:
-  - Ensure Docker Desktop / daemon is running on your machine.
-  - Review the build output for npm install errors; run `docker compose up --build` again to see logs.
-
----
-
-## Common commands
+Inactive subscriber:
 
 ```bash
-docker compose up --build -d
-docker compose ps
-docker compose logs -f vas-platform
-docker compose logs -f ussd-gateway
+curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+  -H "Content-Type: application/json" \
+  -d '{
+    "protocol": "SS7-MAP-MOCK",
+    "eventType": "USSD_REQUEST",
+    "msisdn": "970599123456",
+    "serviceType": "USSD",
+    "serviceCode": "*123#",
+    "originPointCode": "1234",
+    "destinationPointCode": "5678",
+    "globalTitle": "970599123456",
+    "visitedNetwork": "LOCAL",
+    "simulateFailure": "SUBSCRIBER_NOT_ACTIVE"
+  }'
 ```
 
----
+Billing failure:
 
-## What I learned
+```bash
+curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+  -H "Content-Type: application/json" \
+  -d '{
+    "protocol": "SS7-MAP-MOCK",
+    "eventType": "USSD_REQUEST",
+    "msisdn": "970599123456",
+    "serviceType": "USSD",
+    "serviceCode": "*123#",
+    "originPointCode": "1234",
+    "destinationPointCode": "5678",
+    "globalTitle": "970599123456",
+    "visitedNetwork": "LOCAL",
+    "simulateFailure": "BILLING_FAILED"
+  }'
+```
 
-This mini lab demonstrates core concepts of a VAS architecture: how USSD front-ends map to business logic, the importance of reliable CRM/Billing lookups before charging, the implications of ordering (charge before activation), and how to design for observability and compensation when external dependencies fail. It reinforces practical lessons about local integration testing with Docker Compose, simple fault injection, and end-to-end traceability.
+Roaming USSD request:
 
----
+```bash
+curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+  -H "Content-Type: application/json" \
+  -d '{
+    "protocol": "SS7-MAP-MOCK",
+    "eventType": "USSD_REQUEST",
+    "msisdn": "970599123456",
+    "serviceType": "ROAMING_USSD",
+    "serviceCode": "*123#",
+    "originPointCode": "1234",
+    "destinationPointCode": "5678",
+    "globalTitle": "970599123456",
+    "visitedNetwork": "ROAMING",
+    "simulateFailure": null
+  }'
+```
 
-## How this relates to real VAS platforms
+SMS/SMSC mock request:
 
-- USSD Gateways: In production, USSD gateways handle session state, concurrency, and operator-specific protocols. This lab models the gateway as a simple HTTP forwarder.
-- VAS Orchestrator: `vas-platform` mimics real business logic that orchestrates CRM, Billing, provisioning, and notifications.
-- CRM and Billing: Real systems have persistent databases, transactional guarantees, and asynchronous eventing. This lab uses simplified HTTP mocks and in-memory state for clarity.
-- Aggregators & SMSC: Real provisioning and SMSC interactions use secured APIs, retries, and idempotency. The lab simulates these interactions and shows how to handle failures.
+```bash
+curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+  -H "Content-Type: application/json" \
+  -d '{
+    "protocol": "SS7-MAP-MOCK",
+    "eventType": "SMS_REQUEST",
+    "msisdn": "970599123456",
+    "serviceType": "SMS",
+    "serviceCode": "DEFAULT",
+    "originPointCode": "1234",
+    "destinationPointCode": "5678",
+    "globalTitle": "970599123456",
+    "visitedNetwork": "LOCAL",
+    "simulateFailure": null
+  }'
+```
 
+KPI endpoint:
+
+```bash
+curl http://127.0.0.1:3002/kpi/today
+```
+
+Health endpoint:
+
+```bash
+curl http://127.0.0.1:3002/health
+```
+
+Transaction search by subscriber:
+
+```bash
+curl "http://127.0.0.1:3002/transactions?msisdn=970599123456"
+```
+
+Transaction search by failure reason:
+
+```bash
+curl "http://127.0.0.1:3002/transactions?failureReason=BILLING_FAILED"
+```
+
+Existing USSD purchase flow:
+
+```bash
+curl -X POST http://127.0.0.1:3001/simulate-ussd \
+  -H "Content-Type: application/json" \
+  -d '{"msisdn":"0599123456","sessionId":"sess-buy","ussdCode":"*123#","text":"1"}'
+```
+
+## CV Description
+
+Telecom Core/VAS Operations Simulator
+
+Extended a VAS simulation project into a Core/VAS operations simulator by adding mock signaling events, routing rules, transaction logging, health checks, KPI reporting, and failure scenarios for USSD, SMS, roaming, and interconnect service flows.
