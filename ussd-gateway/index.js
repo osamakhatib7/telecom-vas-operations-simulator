@@ -104,22 +104,6 @@ function getTopFailureReason(logs) {
 }
 
 function processMockDestination(event, destinationPlatform) {
-  if (event.simulateFailure === 'SUBSCRIBER_NOT_ACTIVE') {
-    return {
-      status: 'FAILED',
-      failureReason: 'SUBSCRIBER_NOT_ACTIVE',
-      errorMessage: 'Subscriber is not active for this service.',
-    };
-  }
-
-  if (event.simulateFailure === 'BILLING_FAILED') {
-    return {
-      status: 'FAILED',
-      failureReason: 'BILLING_FAILED',
-      errorMessage: 'Mock billing validation failed.',
-    };
-  }
-
   if (event.simulateFailure === 'PARTNER_TIMEOUT') {
     return {
       status: 'FAILED',
@@ -131,8 +115,8 @@ function processMockDestination(event, destinationPlatform) {
   if (event.simulateFailure === 'INTERNAL_ERROR') {
     return {
       status: 'FAILED',
-      failureReason: 'INTERNAL_ERROR',
-      errorMessage: 'Internal mock processing error.',
+      failureReason: 'GATEWAY_INTERNAL_ERROR',
+      errorMessage: 'Internal gateway mock processing error.',
     };
   }
 
@@ -295,7 +279,20 @@ app.post('/simulate/signaling-event', async (req, res) => {
     return res.status(404).json(result);
   }
 
-  if (routingRule.destinationPlatform === 'VAS_PLATFORM' && !event.simulateFailure) {
+  if (event.simulateFailure === 'INTERNAL_ERROR') {
+    const result = {
+      transactionId,
+      decision: 'MOCK_PROCESSING_FAILED',
+      destinationPlatform: routingRule.destinationPlatform,
+      status: 'FAILED',
+      failureReason: 'GATEWAY_INTERNAL_ERROR',
+      errorMessage: 'Internal gateway mock processing error.',
+    };
+    createTransactionLog(event, result);
+    return res.status(500).json(result);
+  }
+
+  if (routingRule.destinationPlatform === 'VAS_PLATFORM') {
     const vasPayload = {
       msisdn: event.msisdn,
       sessionId: transactionId,
@@ -312,6 +309,31 @@ app.post('/simulate/signaling-event', async (req, res) => {
       });
 
       const vasResponse = await response.json();
+      const vasFailed = !response.ok || vasResponse.continueSession === false;
+      const businessFailureReason = vasResponse.failureReason || (
+        ['SUBSCRIBER_NOT_ACTIVE', 'BILLING_FAILED'].includes(event.simulateFailure)
+          ? event.simulateFailure
+          : null
+      );
+
+      if (vasFailed && businessFailureReason) {
+        const result = {
+          transactionId,
+          decision: `ROUTE_TO_${routingRule.destinationPlatform}`,
+          destinationPlatform: routingRule.destinationPlatform,
+          status: 'FAILED',
+          failureReason: businessFailureReason,
+          errorMessage: vasResponse.message || 'VAS platform returned a business failure.',
+        };
+        createTransactionLog(event, result);
+        return res.status(response.ok ? 200 : response.status).json({
+          ...result,
+          sessionId: vasResponse.sessionId,
+          continueSession: vasResponse.continueSession,
+          message: vasResponse.message,
+          vasResponse,
+        });
+      }
 
       if (!response.ok) {
         const result = {

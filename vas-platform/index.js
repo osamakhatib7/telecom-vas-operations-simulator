@@ -62,11 +62,13 @@ app.post('/ussd', async (req, res) => {
 
   try {
     // Build query param for failure simulation if present
-    const failureQs = simulateFailure ? `?simulateFailure=${encodeURIComponent(simulateFailure)}` : '';
+    const buildFailureQs = (failure) => failure ? `?simulateFailure=${encodeURIComponent(failure)}` : '';
+    const crmFailure = ['SUBSCRIBER_NOT_ACTIVE', 'BILLING_FAILED'].includes(simulateFailure) ? null : simulateFailure;
+    const billingFailure = simulateFailure === 'BILLING_FAILED' ? 'billing-500' : simulateFailure;
 
     console.log('[vas-platform] calling CRM', { sessionId, msisdn, simulateFailure });
     const crmResponse = await Promise.race([
-      fetch(`http://crm-service:3003/subscribers/${encodeURIComponent(msisdn)}${failureQs}`),
+      fetch(`http://crm-service:3003/subscribers/${encodeURIComponent(msisdn)}${buildFailureQs(crmFailure)}`),
       new Promise((_, reject) => setTimeout(() => reject(new Error('CRM timeout')), 5000))
     ]).catch(err => err);
 
@@ -94,6 +96,12 @@ app.post('/ussd', async (req, res) => {
     const crmData = await crmResponse.json();
     console.log('[vas-platform] CRM response', { sessionId, status: crmData.status, crmData });
 
+    if (simulateFailure === 'SUBSCRIBER_NOT_ACTIVE') {
+      const message = 'Your subscription is suspended. Please contact support.';
+      console.log('[vas-platform] final response', { sessionId, message, reason: 'subscriber_not_active_simulation' });
+      return res.json({ sessionId, continueSession: false, message, failureReason: 'SUBSCRIBER_NOT_ACTIVE' });
+    }
+
     if (crmData.status === 'SUSPENDED') {
       const message = 'Your subscription is suspended. Please contact support.';
       console.log('[vas-platform] final response', { sessionId, message });
@@ -108,7 +116,7 @@ app.post('/ussd', async (req, res) => {
 
     console.log('[vas-platform] calling Billing', { sessionId, msisdn, simulateFailure });
     const billingResponse = await Promise.race([
-      fetch(`http://billing-service:3004/balance/${encodeURIComponent(msisdn)}${failureQs}`),
+      fetch(`http://billing-service:3004/balance/${encodeURIComponent(msisdn)}${buildFailureQs(billingFailure)}`),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Billing timeout')), 5000))
     ]).catch(err => err);
 
@@ -116,7 +124,7 @@ app.post('/ussd', async (req, res) => {
       console.log('[vas-platform] Billing failed', { sessionId, error: billingResponse.message });
       const message = 'Unable to check or charge your balance right now. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message, reason: 'billing_failure' });
-      return res.json({ sessionId, continueSession: false, message });
+      return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
     }
 
     // Handle 404 specifically before treating other 4xx/5xx errors
@@ -130,7 +138,7 @@ app.post('/ussd', async (req, res) => {
       console.log('[vas-platform] Billing error', { sessionId, status: billingResponse.status });
       const message = 'Unable to check or charge your balance right now. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message, reason: 'billing_error' });
-      return res.json({ sessionId, continueSession: false, message });
+      return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
     }
 
     const billingData = await billingResponse.json();
@@ -162,7 +170,7 @@ app.post('/ussd', async (req, res) => {
         fetch('http://billing-service:3004/charge', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ msisdn, amount: 5, simulateFailure }),
+          body: JSON.stringify({ msisdn, amount: 5, simulateFailure: billingFailure }),
         }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Charge timeout')), 5000))
       ]).catch(err => err);
@@ -171,14 +179,14 @@ app.post('/ussd', async (req, res) => {
         console.log('[vas-platform] Charge failed', { sessionId, error: chargeResponse.message });
         const message = 'Unable to check or charge your balance right now. Please try again later.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'charge_failure' });
-        return res.json({ sessionId, continueSession: false, message });
+        return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
       }
 
       if (!chargeResponse.ok || chargeResponse.status >= 400) {
         console.log('[vas-platform] Charge error', { sessionId, status: chargeResponse.status });
         const message = 'Unable to check or charge your balance right now. Please try again later.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'charge_error' });
-        return res.json({ sessionId, continueSession: false, message });
+        return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
       }
 
       const chargeData = await chargeResponse.json();

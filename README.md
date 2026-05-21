@@ -61,7 +61,7 @@ The `core-network-mock` service is only a mock signaling source. It is not a rea
 - In-memory transaction logs in the USSD Gateway.
 - KPI endpoint for today's signaling traffic in the USSD Gateway.
 - Health endpoint with component status.
-- Failure simulation for routing, subscriber, billing, partner, and internal failures.
+- Failure simulation split between gateway routing failures and VAS business failures.
 
 ## Routing Rules
 
@@ -231,17 +231,26 @@ Example response:
 
 ## Failure Scenarios
 
-The mock signaling-event flow supports these failure scenarios:
+Gateway and VAS failures are intentionally owned by different layers.
+
+The USSD Gateway handles routing and signaling-layer failures:
 
 | Scenario | How to Trigger | Result |
 |---|---|---|
 | Unknown service code | Use an unmapped `serviceCode` | `ROUTING_NOT_FOUND` |
-| Subscriber not active | `simulateFailure: "SUBSCRIBER_NOT_ACTIVE"` | `FAILED` |
-| Billing failure | `simulateFailure: "BILLING_FAILED"` | `FAILED` |
-| Partner timeout | `simulateFailure: "PARTNER_TIMEOUT"` | `FAILED` |
-| Internal error | `simulateFailure: "INTERNAL_ERROR"` | `FAILED` |
+| Gateway internal error | `simulateFailure: "INTERNAL_ERROR"` | `GATEWAY_INTERNAL_ERROR` |
+| Partner timeout for mock partner destinations | `simulateFailure: "PARTNER_TIMEOUT"` with `ROAMING_GATEWAY_MOCK`, `INTERCONNECT_GATEWAY_MOCK`, or `SMSC_MOCK` | `PARTNER_TIMEOUT` |
 
-The existing USSD purchase flow also supports mock failures for CRM, Billing, Aggregator, and SMSC.
+The VAS Platform handles business/application failures through its normal `/ussd` flow:
+
+| Scenario | How to Trigger | Owner |
+|---|---|---|
+| Subscriber not active | `simulateFailure: "SUBSCRIBER_NOT_ACTIVE"` routed to `VAS_PLATFORM` | CRM/subscriber logic in VAS flow |
+| Billing failure | `simulateFailure: "BILLING_FAILED"` routed to `VAS_PLATFORM` | Billing logic in VAS flow |
+| Aggregator failure | Existing aggregator failure flags during purchase | VAS purchase flow |
+| SMSC failure | Existing SMSC failure flags during purchase | VAS purchase flow |
+
+The gateway passes VAS business failure flags through to the converted `/ussd` request instead of failing them at the routing layer.
 
 ## Troubleshooting Examples
 
