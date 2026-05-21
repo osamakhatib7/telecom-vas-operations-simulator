@@ -8,7 +8,7 @@ The project started as a Mini Telecom VAS Lab and was extended into a small Core
 
 ## Important Note
 
-This project is a Core/VAS operations simulator, not a real telecom core implementation. It does not implement real SS7, SIP, SMPP, MSC, HSS, or UDM protocols. It uses mock signaling events to demonstrate routing decisions, USSD/VAS flow, transaction logging, KPI monitoring, health checks, and failure troubleshooting. HTTP endpoints are used only as a test interface to trigger simulated telecom events.
+This project is a Core/VAS operations simulator, not a real telecom core implementation. It does not implement real SS7, SIP, SMPP, MSC, HSS, or UDM protocols. It uses mock signaling events to demonstrate routing decisions, USSD/VAS flow, transaction logging, KPI monitoring, health checks, and failure troubleshooting. HTTP endpoints are used only as a test interface to trigger simulated telecom events. The `core-network-mock` service is only a mock signaling source used for testing.
 
 ## Why This Project
 
@@ -27,27 +27,31 @@ This project demonstrates those ideas without pretending to be a real telecom ne
 
 ```text
 Test Client
-  -> USSD Gateway (3001)
-    -> VAS Platform (3002)
-      -> CRM Service (3003)
-      -> Billing Service (3004)
-      -> Aggregator Service (3006)
-      -> SMSC Service (3005)
+  -> Core Network Mock (3007)
+    -> USSD Gateway (3001)
+      -> VAS Platform (3002)
+        -> CRM Service (3003)
+        -> Billing Service (3004)
+        -> Aggregator Service (3006)
+        -> SMSC Service (3005)
+        -> Mock destination platforms
 
 Mock signaling events
-  -> USSD Gateway POST /simulate/signaling-event
-    -> VAS Platform POST /signaling-event
-      -> Routing rules
-      -> Mock destination platform
-      -> Transaction log
-      -> KPI counters
+  -> Core Network Mock POST /simulate/signaling-event
+    -> USSD Gateway POST /simulate/signaling-event
+      -> VAS Platform POST /signaling-event
+        -> Routing rules
+        -> Mock destination platform
+        -> Transaction log
+        -> KPI calculation
 ```
 
-The existing VAS purchase flow still uses the CRM, Billing, Aggregator, and SMSC mock services. The new signaling-event flow is handled inside the VAS platform using in-memory routing rules and transaction logs.
+The `core-network-mock` service is only a mock signaling source. It is not a real core network implementation. The existing VAS purchase flow still uses the CRM, Billing, Aggregator, and SMSC mock services. The signaling-event flow is handled inside the VAS platform using in-memory routing rules and transaction logs.
 
 ## Features
 
-- Mock USSD gateway for test traffic.
+- Core Network Mock service as the official test entry point for mock signaling events.
+- Mock USSD gateway for forwarding USSD and mock signaling traffic.
 - Existing USSD bundle purchase flow.
 - Mock CRM subscriber lookup.
 - Mock Billing balance lookup and charging.
@@ -83,13 +87,19 @@ Each rule includes:
 
 ## Mock Signaling Event Endpoint
 
-The gateway exposes:
+The Core Network Mock service exposes the official public test entry point:
 
 ```text
 POST /simulate/signaling-event
 ```
 
-This endpoint accepts a mock telecom event and forwards it to:
+Use it through port `3007`:
+
+```text
+POST http://127.0.0.1:3007/simulate/signaling-event
+```
+
+This endpoint accepts a mock telecom event and forwards it to the USSD Gateway. The gateway then forwards it to:
 
 ```text
 POST /signaling-event
@@ -295,6 +305,7 @@ Main exposed ports:
 
 | Service | Port |
 |---|---:|
+| Core Network Mock | 3007 |
 | USSD Gateway | 3001 |
 | VAS Platform | 3002 |
 | CRM Service | 3003 |
@@ -307,7 +318,7 @@ Main exposed ports:
 Successful USSD signaling event:
 
 ```bash
-curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
   -H "Content-Type: application/json" \
   -d '{
     "protocol": "SS7-MAP-MOCK",
@@ -326,7 +337,7 @@ curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
 Unknown USSD code:
 
 ```bash
-curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
   -H "Content-Type: application/json" \
   -d '{
     "protocol": "SS7-MAP-MOCK",
@@ -345,7 +356,7 @@ curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
 Inactive subscriber:
 
 ```bash
-curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
   -H "Content-Type: application/json" \
   -d '{
     "protocol": "SS7-MAP-MOCK",
@@ -364,7 +375,7 @@ curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
 Billing failure:
 
 ```bash
-curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
   -H "Content-Type: application/json" \
   -d '{
     "protocol": "SS7-MAP-MOCK",
@@ -383,7 +394,7 @@ curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
 Roaming USSD request:
 
 ```bash
-curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
   -H "Content-Type: application/json" \
   -d '{
     "protocol": "SS7-MAP-MOCK",
@@ -402,7 +413,7 @@ curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
 SMS/SMSC mock request:
 
 ```bash
-curl -X POST http://127.0.0.1:3001/simulate/signaling-event \
+curl -X POST http://127.0.0.1:3007/simulate/signaling-event \
   -H "Content-Type: application/json" \
   -d '{
     "protocol": "SS7-MAP-MOCK",
