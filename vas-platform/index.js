@@ -25,9 +25,9 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', async (req, res) => {
-  const [crmService, billingService, aggregatorService, smscService] = await Promise.all([
+  const [crmService, ocsService, aggregatorService, smscService] = await Promise.all([
     checkDependencyHealth('http://crm-service:3003/health'),
-    checkDependencyHealth('http://billing-service:3004/health'),
+    checkDependencyHealth('http://ocs-service:3004/health'),
     checkDependencyHealth('http://aggregator-service:3006/health'),
     checkDependencyHealth('http://smsc-service:3005/health'),
   ]);
@@ -35,7 +35,7 @@ app.get('/health', async (req, res) => {
   const components = {
     vasService: 'UP',
     crmService,
-    billingService,
+    ocsService,
     aggregatorService,
     smscService,
   };
@@ -64,7 +64,7 @@ app.post('/ussd', async (req, res) => {
     // Build query param for failure simulation if present
     const buildFailureQs = (failure) => failure ? `?simulateFailure=${encodeURIComponent(failure)}` : '';
     const crmFailure = ['SUBSCRIBER_NOT_ACTIVE', 'BILLING_FAILED'].includes(simulateFailure) ? null : simulateFailure;
-    const billingFailure = simulateFailure === 'BILLING_FAILED' ? 'billing-500' : simulateFailure;
+    const ocsFailure = simulateFailure === 'BILLING_FAILED' ? 'billing-500' : simulateFailure;
 
     console.log('[vas-platform] calling CRM', { sessionId, msisdn, simulateFailure });
     const crmResponse = await Promise.race([
@@ -114,37 +114,37 @@ app.post('/ussd', async (req, res) => {
       return res.json({ sessionId, continueSession: false, message });
     }
 
-    console.log('[vas-platform] calling Billing', { sessionId, msisdn, simulateFailure });
-    const billingResponse = await Promise.race([
-      fetch(`http://billing-service:3004/balance/${encodeURIComponent(msisdn)}${buildFailureQs(billingFailure)}`),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Billing timeout')), 5000))
+    console.log('[vas-platform] calling OCS', { sessionId, msisdn, simulateFailure });
+    const ocsResponse = await Promise.race([
+      fetch(`http://ocs-service:3004/balance/${encodeURIComponent(msisdn)}${buildFailureQs(ocsFailure)}`),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('OCS timeout')), 5000))
     ]).catch(err => err);
 
-    if (billingResponse instanceof Error) {
-      console.log('[vas-platform] Billing failed', { sessionId, error: billingResponse.message });
+    if (ocsResponse instanceof Error) {
+      console.log('[vas-platform] OCS failed', { sessionId, error: ocsResponse.message });
       const message = 'Unable to check or charge your balance right now. Please try again later.';
-      console.log('[vas-platform] final response', { sessionId, message, reason: 'billing_failure' });
+      console.log('[vas-platform] final response', { sessionId, message, reason: 'ocs_failure' });
       return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
     }
 
     // Handle 404 specifically before treating other 4xx/5xx errors
-    if (billingResponse.status === 404) {
+    if (ocsResponse.status === 404) {
       const message = 'Balance information not found. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message, status: 404 });
       return res.json({ sessionId, continueSession: false, message });
     }
 
-    if (!billingResponse.ok) {
-      console.log('[vas-platform] Billing error', { sessionId, status: billingResponse.status });
+    if (!ocsResponse.ok) {
+      console.log('[vas-platform] OCS error', { sessionId, status: ocsResponse.status });
       const message = 'Unable to check or charge your balance right now. Please try again later.';
-      console.log('[vas-platform] final response', { sessionId, message, reason: 'billing_error' });
+      console.log('[vas-platform] final response', { sessionId, message, reason: 'ocs_error' });
       return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
     }
 
-    const billingData = await billingResponse.json();
-    console.log('[vas-platform] Billing response', { sessionId, status: billingData.status, billingData });
+    const ocsData = await ocsResponse.json();
+    console.log('[vas-platform] OCS response', { sessionId, status: ocsData.status, ocsData });
 
-    const balance = billingData.balance;
+    const balance = ocsData.balance;
 
     if (text.trim() === '' || text.trim() === '0') {
       const message = `Welcome to VAS Platform\nYour balance is: ${balance} NIS\n1. Buy bundle\n2. Exit`;
@@ -165,14 +165,14 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
-      console.log('[vas-platform] charging account', { sessionId, msisdn, amount: 5, simulateFailure });
+      console.log('[vas-platform] charging account through OCS', { sessionId, msisdn, amount: 5, simulateFailure });
       const chargeResponse = await Promise.race([
-        fetch('http://billing-service:3004/charge', {
+        fetch('http://ocs-service:3004/charge', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ msisdn, amount: 5, simulateFailure: billingFailure }),
+          body: JSON.stringify({ msisdn, amount: 5, simulateFailure: ocsFailure }),
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Charge timeout')), 5000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('OCS charge timeout')), 5000))
       ]).catch(err => err);
 
       if (chargeResponse instanceof Error) {

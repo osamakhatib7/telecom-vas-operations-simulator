@@ -1,5 +1,20 @@
 version: '3.9'
 services:
+  mysql-db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: vas_lab
+      MYSQL_USER: vas_user
+      MYSQL_PASSWORD: vas_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "vas_user", "-pvas_password"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
   core-network-mock:
     build: ./core-network-mock
     ports:
@@ -12,14 +27,25 @@ services:
     build: ./vas-platform
     ports:
       - "3002:3002"
+    depends_on:
+      - ocs-service
   crm-service:
     build: ./crm-service
     ports:
       - "3003:3003"
-  billing-service:
-    build: ./billing-service
+  ocs-service:
+    build: ./ocs-service
     ports:
       - "3004:3004"
+    environment:
+      DB_HOST: mysql-db
+      DB_PORT: 3306
+      DB_USER: vas_user
+      DB_PASSWORD: vas_password
+      DB_NAME: vas_lab
+    depends_on:
+      mysql-db:
+        condition: service_healthy
   smsc-service:
     build: ./smsc-service
     ports:
@@ -28,3 +54,6 @@ services:
     build: ./aggregator-service
     ports:
       - "3006:3006"
+
+volumes:
+  mysql-data:
