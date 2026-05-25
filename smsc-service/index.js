@@ -1,10 +1,9 @@
 const express = require('express');
+const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 const app = express();
 const PORT = process.env.PORT || 3005;
-
-app.use(express.json());
 
 const dbConfig = {
   host: process.env.DB_HOST || 'mysql-db',
@@ -18,10 +17,56 @@ const dbConfig = {
 
 let pool;
 
+function createCorrelationId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getCorrelationId(req) {
+  const incomingCorrelationId = req.headers['x-correlation-id'];
+  if (Array.isArray(incomingCorrelationId)) {
+    return incomingCorrelationId[0] || createCorrelationId();
+  }
+
+  return incomingCorrelationId || createCorrelationId();
+}
+
+function logWithCorrelation(correlationId, message, extra = {}) {
+  if (Object.keys(extra).length > 0) {
+    console.log(`[smsc-service] [correlationId=${correlationId}] ${message}`, extra);
+    return;
+  }
+
+  console.log(`[smsc-service] [correlationId=${correlationId}] ${message}`);
+}
+
+function addCorrelationToJsonResponse(req, res) {
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    const responseBody = body
+      && typeof body === 'object'
+      && !Array.isArray(body)
+      && !Object.prototype.hasOwnProperty.call(body, 'correlationId')
+      ? { ...body, correlationId: req.correlationId }
+      : body;
+
+    logWithCorrelation(req.correlationId, 'final response returned', { status: res.statusCode });
+    return originalJson(responseBody);
+  };
+}
+
 app.use((req, res, next) => {
-  console.log(`[smsc-service] ${req.method} ${req.url}`);
+  req.correlationId = getCorrelationId(req);
+  res.setHeader('X-Correlation-ID', req.correlationId);
+  addCorrelationToJsonResponse(req, res);
+  logWithCorrelation(req.correlationId, `${req.method} ${req.url}`);
   next();
 });
+
+app.use(express.json());
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -75,14 +120,14 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     return res.json({ status: 'ok', service: 'smsc-service', database: 'UP' });
   } catch (error) {
-    console.error('[smsc-service] health check failed', { error: error.message });
+    console.error(`[smsc-service] [correlationId=${req.correlationId}] health check failed`, { error: error.message });
     return res.status(500).json({ status: 'error', service: 'smsc-service', database: 'DOWN' });
   }
 });
 
 app.get('/attempts/:msisdn', async (req, res) => {
   const { msisdn } = req.params;
-  console.log('[smsc-service] sms attempts lookup', { msisdn });
+  logWithCorrelation(req.correlationId, 'sms attempts lookup', { msisdn });
 
   try {
     const [attempts] = await pool.query(
@@ -106,14 +151,14 @@ app.get('/attempts/:msisdn', async (req, res) => {
       attempts,
     });
   } catch (error) {
-    console.error('[smsc-service] sms attempts lookup failed', { msisdn, error: error.message });
+    console.error(`[smsc-service] [correlationId=${req.correlationId}] sms attempts lookup failed`, { msisdn, error: error.message });
     return res.status(500).json({ error: 'SMSC attempts lookup error' });
   }
 });
 
 app.post('/send-sms', async (req, res) => {
   const { msisdn, message, simulateFailure, referenceId } = req.body;
-  console.log('[smsc-service] send sms', { msisdn, message, simulateFailure, referenceId });
+  logWithCorrelation(req.correlationId, 'send sms', { msisdn, message, simulateFailure, referenceId });
 
   try {
     if (!msisdn || !message) {
@@ -128,7 +173,7 @@ app.post('/send-sms', async (req, res) => {
     }
 
     if (simulateFailure === 'smsc-down') {
-      console.log('[smsc-service] simulating service down (500)', { msisdn });
+      logWithCorrelation(req.correlationId, 'simulating service down (500)', { msisdn });
       await recordSmsAttempt({
         msisdn,
         message,
@@ -140,7 +185,7 @@ app.post('/send-sms', async (req, res) => {
     }
 
     if (simulateFailure === 'smsc-failed') {
-      console.log('[smsc-service] simulating delivery failure', { msisdn });
+      logWithCorrelation(req.correlationId, 'simulating delivery failure', { msisdn });
       await recordSmsAttempt({
         msisdn,
         message,
@@ -157,9 +202,10 @@ app.post('/send-sms', async (req, res) => {
       deliveryStatus: 'DELIVERED',
       referenceId,
     });
+    logWithCorrelation(req.correlationId, 'SMS delivery successful', { msisdn, referenceId });
     return res.json({ deliveryStatus: 'DELIVERED' });
   } catch (error) {
-    console.error('[smsc-service] send sms failed', { msisdn, error: error.message });
+    console.error(`[smsc-service] [correlationId=${req.correlationId}] send sms failed`, { msisdn, error: error.message });
     return res.status(500).json({ error: 'SMSC service error' });
   }
 });

@@ -1,8 +1,33 @@
 const express = require('express');
+const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(express.json());
+function createCorrelationId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getCorrelationId(req) {
+  const incomingCorrelationId = req.headers['x-correlation-id'];
+  if (Array.isArray(incomingCorrelationId)) {
+    return incomingCorrelationId[0] || createCorrelationId();
+  }
+
+  return incomingCorrelationId || createCorrelationId();
+}
+
+function logWithCorrelation(correlationId, message, extra = {}) {
+  if (Object.keys(extra).length > 0) {
+    console.log(`[ussd-gateway] [correlationId=${correlationId}] ${message}`, extra);
+    return;
+  }
+
+  console.log(`[ussd-gateway] [correlationId=${correlationId}] ${message}`);
+}
 
 const routingRules = [
   {
@@ -63,9 +88,10 @@ function findRoutingRule(serviceType, serviceCode) {
     .sort((a, b) => a.priority - b.priority)[0];
 }
 
-function createTransactionLog(event, result) {
+function createTransactionLog(event, result, correlationId) {
   const transactionLog = {
     transactionId: result.transactionId,
+    correlationId,
     msisdn: event.msisdn,
     protocol: event.protocol,
     eventType: event.eventType,
@@ -79,7 +105,7 @@ function createTransactionLog(event, result) {
   };
 
   transactionLogs.push(transactionLog);
-  console.log('[ussd-gateway] transaction log created', transactionLog);
+  logWithCorrelation(correlationId, 'transaction log created', transactionLog);
   return transactionLog;
 }
 
@@ -134,12 +160,17 @@ function processMockDestination(event, destinationPlatform) {
 }
 
 app.use((req, res, next) => {
-  console.log(`[ussd-gateway] ${req.method} ${req.url}`);
+  req.correlationId = getCorrelationId(req);
+  res.setHeader('X-Correlation-ID', req.correlationId);
+  logWithCorrelation(req.correlationId, `${req.method} ${req.url}`);
   next();
 });
 
+app.use(express.json());
+
 app.get('/health', (req, res) => {
   res.json({
+    correlationId: req.correlationId,
     status: 'UP',
     service: 'ussd-gateway',
     role: 'USSD Gateway / Service Broker',
@@ -170,6 +201,7 @@ app.get('/kpi/today', (req, res) => {
   });
 
   return res.json({
+    correlationId: req.correlationId,
     totalRequests,
     successCount,
     failedCount,
@@ -193,6 +225,7 @@ app.get('/transactions', (req, res) => {
     .reverse();
 
   return res.json({
+    correlationId: req.correlationId,
     count: filteredLogs.length,
     transactions: filteredLogs,
   });
@@ -200,7 +233,7 @@ app.get('/transactions', (req, res) => {
 
 app.post('/simulate-ussd', async (req, res) => {
   const { msisdn, sessionId, ussdCode, text, simulateFailure } = req.body;
-  console.log('[ussd-gateway] received simulate-ussd', { msisdn, sessionId, ussdCode, text, simulateFailure });
+  logWithCorrelation(req.correlationId, 'received simulate-ussd', { msisdn, sessionId, ussdCode, text, simulateFailure });
 
   const payload = { msisdn, sessionId, ussdCode, text };
   if (simulateFailure) {
@@ -208,26 +241,30 @@ app.post('/simulate-ussd', async (req, res) => {
   }
 
   try {
+    logWithCorrelation(req.correlationId, 'forwarding simulate-ussd to vas-platform', { msisdn, sessionId, ussdCode });
     const response = await fetch('http://vas-platform:3002/ussd', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Correlation-ID': req.correlationId,
+      },
       body: JSON.stringify(payload),
     });
 
     const data = await response.json();
-    console.log('[ussd-gateway] forwarded to vas-platform', { status: response.status, response: data });
+    logWithCorrelation(req.correlationId, 'received response from vas-platform', { status: response.status, response: data });
 
-    return res.status(response.status).json(data);
+    return res.status(response.status).json({ ...data, correlationId: req.correlationId });
   } catch (error) {
-    console.error('[ussd-gateway] error forwarding to vas-platform', error);
-    return res.status(502).json({ error: 'Failed to forward to vas-platform' });
+    console.error(`[ussd-gateway] [correlationId=${req.correlationId}] error forwarding to vas-platform`, error);
+    return res.status(502).json({ correlationId: req.correlationId, error: 'Failed to forward to vas-platform' });
   }
 });
 
 app.post('/simulate/signaling-event', async (req, res) => {
   const event = req.body;
   const transactionId = createTransactionId();
-  console.log('[ussd-gateway] received signaling event', {
+  logWithCorrelation(req.correlationId, 'received signaling event', {
     transactionId,
     protocol: event.protocol,
     eventType: event.eventType,
@@ -260,8 +297,9 @@ app.post('/simulate/signaling-event', async (req, res) => {
       failureReason: 'VALIDATION_FAILED',
       errorMessage: `Missing required fields: ${missingFields.join(', ')}`,
     };
-    createTransactionLog(event, result);
-    return res.status(400).json(result);
+    logWithCorrelation(req.correlationId, 'validation failure', { transactionId, missingFields });
+    createTransactionLog(event, result, req.correlationId);
+    return res.status(400).json({ ...result, correlationId: req.correlationId });
   }
 
   const routingRule = findRoutingRule(event.serviceType, event.serviceCode);
@@ -275,9 +313,20 @@ app.post('/simulate/signaling-event', async (req, res) => {
       failureReason: 'ROUTING_NOT_FOUND',
       errorMessage: 'No active routing rule found for serviceType and serviceCode.',
     };
-    createTransactionLog(event, result);
-    return res.status(404).json(result);
+    logWithCorrelation(req.correlationId, 'routing failure', {
+      transactionId,
+      serviceType: event.serviceType,
+      serviceCode: event.serviceCode,
+    });
+    createTransactionLog(event, result, req.correlationId);
+    return res.status(404).json({ ...result, correlationId: req.correlationId });
   }
+
+  logWithCorrelation(req.correlationId, 'routing decision', {
+    transactionId,
+    ruleId: routingRule.id,
+    destinationPlatform: routingRule.destinationPlatform,
+  });
 
   if (event.simulateFailure === 'INTERNAL_ERROR') {
     const result = {
@@ -288,8 +337,9 @@ app.post('/simulate/signaling-event', async (req, res) => {
       failureReason: 'GATEWAY_INTERNAL_ERROR',
       errorMessage: 'Internal gateway mock processing error.',
     };
-    createTransactionLog(event, result);
-    return res.status(500).json(result);
+    logWithCorrelation(req.correlationId, 'gateway internal error simulation', { transactionId });
+    createTransactionLog(event, result, req.correlationId);
+    return res.status(500).json({ ...result, correlationId: req.correlationId });
   }
 
   if (routingRule.destinationPlatform === 'VAS_PLATFORM') {
@@ -302,13 +352,25 @@ app.post('/simulate/signaling-event', async (req, res) => {
     };
 
     try {
+      logWithCorrelation(req.correlationId, 'converted signaling event to /ussd payload', {
+        transactionId,
+        vasPayload,
+      });
       const response = await fetch('http://vas-platform:3002/ussd', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Correlation-ID': req.correlationId,
+        },
         body: JSON.stringify(vasPayload),
       });
 
       const vasResponse = await response.json();
+      logWithCorrelation(req.correlationId, 'received response from vas-platform', {
+        transactionId,
+        status: response.status,
+        vasResponse,
+      });
       const vasFailed = !response.ok || vasResponse.continueSession === false;
       const businessFailureReason = vasResponse.failureReason || (
         ['SUBSCRIBER_NOT_ACTIVE', 'BILLING_FAILED'].includes(event.simulateFailure)
@@ -325,9 +387,11 @@ app.post('/simulate/signaling-event', async (req, res) => {
           failureReason: businessFailureReason,
           errorMessage: vasResponse.message || 'VAS platform returned a business failure.',
         };
-        createTransactionLog(event, result);
+        createTransactionLog(event, result, req.correlationId);
+        logWithCorrelation(req.correlationId, 'final response returned', { transactionId, status: response.ok ? 200 : response.status });
         return res.status(response.ok ? 200 : response.status).json({
           ...result,
+          correlationId: req.correlationId,
           sessionId: vasResponse.sessionId,
           continueSession: vasResponse.continueSession,
           message: vasResponse.message,
@@ -344,9 +408,11 @@ app.post('/simulate/signaling-event', async (req, res) => {
           failureReason: 'VAS_PLATFORM_ERROR',
           errorMessage: 'VAS platform did not accept the converted USSD request.',
         };
-        createTransactionLog(event, result);
+        createTransactionLog(event, result, req.correlationId);
+        logWithCorrelation(req.correlationId, 'final response returned', { transactionId, status: response.status });
         return res.status(response.status).json({
           ...result,
+          correlationId: req.correlationId,
           vasResponse,
         });
       }
@@ -357,9 +423,11 @@ app.post('/simulate/signaling-event', async (req, res) => {
         destinationPlatform: routingRule.destinationPlatform,
         status: 'SUCCESS',
       };
-      createTransactionLog(event, result);
+      createTransactionLog(event, result, req.correlationId);
+      logWithCorrelation(req.correlationId, 'final response returned', { transactionId, status: response.status });
       return res.status(response.status).json({
         ...result,
+        correlationId: req.correlationId,
         sessionId: vasResponse.sessionId,
         continueSession: vasResponse.continueSession,
         message: vasResponse.message,
@@ -374,12 +442,18 @@ app.post('/simulate/signaling-event', async (req, res) => {
         failureReason: 'PARTNER_TIMEOUT',
         errorMessage: 'Failed to forward converted USSD request to VAS platform.',
       };
-      createTransactionLog(event, result);
-      return res.status(502).json(result);
+      console.error(`[ussd-gateway] [correlationId=${req.correlationId}] error forwarding converted USSD request to vas-platform`, error);
+      createTransactionLog(event, result, req.correlationId);
+      return res.status(502).json({ ...result, correlationId: req.correlationId });
     }
   }
 
   const platformResult = processMockDestination(event, routingRule.destinationPlatform);
+  logWithCorrelation(req.correlationId, 'mock destination response', {
+    transactionId,
+    destinationPlatform: routingRule.destinationPlatform,
+    platformResult,
+  });
   const decision = platformResult.status === 'SUCCESS'
     ? `ROUTE_TO_${routingRule.destinationPlatform}`
     : 'MOCK_PROCESSING_FAILED';
@@ -399,10 +473,11 @@ app.post('/simulate/signaling-event', async (req, res) => {
     result.errorMessage = platformResult.errorMessage;
   }
 
-  createTransactionLog(event, result);
+  createTransactionLog(event, result, req.correlationId);
 
   const httpStatus = platformResult.status === 'SUCCESS' ? 200 : 500;
-  return res.status(httpStatus).json(result);
+  logWithCorrelation(req.correlationId, 'final response returned', { transactionId, status: httpStatus });
+  return res.status(httpStatus).json({ ...result, correlationId: req.correlationId });
 });
 
 app.listen(PORT, () => {

@@ -1,10 +1,9 @@
 const express = require('express');
+const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 const app = express();
 const PORT = process.env.PORT || 3004;
-
-app.use(express.json());
 
 const initialBalances = {
   '0599123456': 10.5,
@@ -35,10 +34,56 @@ const dbConfig = {
 
 let pool;
 
+function createCorrelationId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getCorrelationId(req) {
+  const incomingCorrelationId = req.headers['x-correlation-id'];
+  if (Array.isArray(incomingCorrelationId)) {
+    return incomingCorrelationId[0] || createCorrelationId();
+  }
+
+  return incomingCorrelationId || createCorrelationId();
+}
+
+function logWithCorrelation(correlationId, message, extra = {}) {
+  if (Object.keys(extra).length > 0) {
+    console.log(`[ocs-service] [correlationId=${correlationId}] ${message}`, extra);
+    return;
+  }
+
+  console.log(`[ocs-service] [correlationId=${correlationId}] ${message}`);
+}
+
+function addCorrelationToJsonResponse(req, res) {
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    const responseBody = body
+      && typeof body === 'object'
+      && !Array.isArray(body)
+      && !Object.prototype.hasOwnProperty.call(body, 'correlationId')
+      ? { ...body, correlationId: req.correlationId }
+      : body;
+
+    logWithCorrelation(req.correlationId, 'final response returned', { status: res.statusCode });
+    return originalJson(responseBody);
+  };
+}
+
 app.use((req, res, next) => {
-  console.log(`[ocs-service] ${req.method} ${req.url}`);
+  req.correlationId = getCorrelationId(req);
+  res.setHeader('X-Correlation-ID', req.correlationId);
+  addCorrelationToJsonResponse(req, res);
+  logWithCorrelation(req.correlationId, `${req.method} ${req.url}`);
   next();
 });
+
+app.use(express.json());
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -241,7 +286,7 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     return res.json({ status: 'ok', service: 'ocs-service', database: 'UP' });
   } catch (error) {
-    console.error('[ocs-service] health check failed', { error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] health check failed`, { error: error.message });
     return res.status(500).json({ status: 'error', service: 'ocs-service', database: 'DOWN' });
   }
 });
@@ -249,15 +294,15 @@ app.get('/health', async (req, res) => {
 app.get('/balance/:msisdn', async (req, res) => {
   const { msisdn } = req.params;
   const { simulateFailure } = req.query;
-  console.log('[ocs-service] lookup balance', { msisdn, simulateFailure });
+  logWithCorrelation(req.correlationId, 'lookup balance', { msisdn, simulateFailure });
 
   if (simulateFailure === 'billing-timeout') {
-    console.log('[ocs-service] simulating timeout', { msisdn });
+    logWithCorrelation(req.correlationId, 'simulating timeout', { msisdn });
     return;
   }
 
   if (simulateFailure === 'billing-500') {
-    console.log('[ocs-service] simulating 500 error', { msisdn });
+    logWithCorrelation(req.correlationId, 'simulating 500 error', { msisdn });
     return res.status(500).json({ error: 'OCS service error' });
   }
 
@@ -269,22 +314,22 @@ app.get('/balance/:msisdn', async (req, res) => {
 
     return res.status(404).json({ error: 'Balance not found' });
   } catch (error) {
-    console.error('[ocs-service] balance lookup failed', { msisdn, error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] balance lookup failed`, { msisdn, error: error.message });
     return res.status(500).json({ error: 'OCS service error' });
   }
 });
 
 app.post('/charge', async (req, res) => {
   const { msisdn, amount, simulateFailure } = req.body;
-  console.log('[ocs-service] charge request', { msisdn, amount, simulateFailure });
+  logWithCorrelation(req.correlationId, 'charge request', { msisdn, amount, simulateFailure });
 
   if (simulateFailure === 'billing-timeout') {
-    console.log('[ocs-service] simulating timeout on charge', { msisdn });
+    logWithCorrelation(req.correlationId, 'simulating timeout on charge', { msisdn });
     return;
   }
 
   if (simulateFailure === 'billing-500') {
-    console.log('[ocs-service] simulating 500 error on charge', { msisdn });
+    logWithCorrelation(req.correlationId, 'simulating 500 error on charge', { msisdn });
     return res.status(500).json({ error: 'OCS service error' });
   }
 
@@ -315,6 +360,12 @@ app.post('/charge', async (req, res) => {
         details: { reason: 'INSUFFICIENT_BALANCE' },
       });
       await connection.commit();
+      logWithCorrelation(req.correlationId, 'charge rejected for insufficient balance', {
+        msisdn,
+        amount,
+        balanceAfter: currentBalance,
+        referenceId,
+      });
       return res.status(400).json({ status: 'INSUFFICIENT_BALANCE', referenceId });
     }
 
@@ -333,10 +384,16 @@ app.post('/charge', async (req, res) => {
     });
     await connection.commit();
 
+    logWithCorrelation(req.correlationId, 'charge successful', {
+      msisdn,
+      amount,
+      newBalance,
+      referenceId,
+    });
     return res.json({ status: 'CHARGED', newBalance, referenceId });
   } catch (error) {
     await connection.rollback();
-    console.error('[ocs-service] charge failed', { msisdn, error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] charge failed`, { msisdn, error: error.message });
     return res.status(500).json({ error: 'OCS service error' });
   } finally {
     connection.release();
@@ -345,7 +402,7 @@ app.post('/charge', async (req, res) => {
 
 app.post('/refund', async (req, res) => {
   const { msisdn, amount, originalReferenceId, reason } = req.body;
-  console.log('[ocs-service] refund request', { msisdn, amount, originalReferenceId, reason });
+  logWithCorrelation(req.correlationId, 'refund request', { msisdn, amount, originalReferenceId, reason });
 
   if (!msisdn || typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
     return res.status(400).json({ error: 'Invalid refund request' });
@@ -363,6 +420,11 @@ app.post('/refund', async (req, res) => {
 
       if (existingRefunds.length > 0) {
         await connection.commit();
+        logWithCorrelation(req.correlationId, 'refund already processed', {
+          msisdn,
+          originalReferenceId,
+          refundReferenceId: existingRefunds[0].refundReferenceId,
+        });
         return res.json({
           status: 'REFUNDED',
           alreadyProcessed: true,
@@ -398,10 +460,17 @@ app.post('/refund', async (req, res) => {
     });
     await connection.commit();
 
+    logWithCorrelation(req.correlationId, 'refund successful', {
+      msisdn,
+      amount,
+      originalReferenceId,
+      refundReferenceId,
+      newBalance,
+    });
     return res.json({ status: 'REFUNDED', newBalance, refundReferenceId });
   } catch (error) {
     await connection.rollback();
-    console.error('[ocs-service] refund failed', { msisdn, error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] refund failed`, { msisdn, error: error.message });
     return res.status(500).json({ error: 'OCS service error' });
   } finally {
     connection.release();
@@ -410,15 +479,15 @@ app.post('/refund', async (req, res) => {
 
 app.post('/bundles/activate', async (req, res) => {
   const { msisdn, offerCode, referenceId, simulateFailure } = req.body;
-  console.log('[ocs-service] bundle activation request', { msisdn, offerCode, referenceId, simulateFailure });
+  logWithCorrelation(req.correlationId, 'bundle activation request', { msisdn, offerCode, referenceId, simulateFailure });
 
   if (simulateFailure === 'ocs-activation-timeout') {
-    console.log('[ocs-service] simulating bundle activation timeout', { msisdn, offerCode });
+    logWithCorrelation(req.correlationId, 'simulating bundle activation timeout', { msisdn, offerCode });
     return;
   }
 
   if (simulateFailure === 'ocs-activation-500') {
-    console.log('[ocs-service] simulating bundle activation error', { msisdn, offerCode });
+    logWithCorrelation(req.correlationId, 'simulating bundle activation error', { msisdn, offerCode });
     return res.status(500).json({ error: 'Bundle activation failed' });
   }
 
@@ -445,6 +514,11 @@ app.post('/bundles/activate', async (req, res) => {
         details: { offerCode },
       });
       await connection.commit();
+      logWithCorrelation(req.correlationId, 'bundle activation rejected because offer is not available', {
+        msisdn,
+        offerCode,
+        referenceId,
+      });
       return res.status(404).json({ status: 'OFFER_NOT_AVAILABLE' });
     }
 
@@ -464,6 +538,11 @@ app.post('/bundles/activate', async (req, res) => {
         details: { offerCode },
       });
       await connection.commit();
+      logWithCorrelation(req.correlationId, 'bundle activation rejected because offer is already active', {
+        msisdn,
+        offerCode,
+        referenceId,
+      });
       return res.status(409).json({ status: 'ALREADY_ACTIVE' });
     }
 
@@ -501,6 +580,12 @@ app.post('/bundles/activate', async (req, res) => {
     });
     await connection.commit();
 
+    logWithCorrelation(req.correlationId, 'bundle activation successful', {
+      msisdn,
+      offerCode: offer.offer_code,
+      activationReferenceId,
+      bundleName: offer.bundle_name,
+    });
     return res.json({
       status: 'ACTIVATED',
       bundle: {
@@ -514,7 +599,7 @@ app.post('/bundles/activate', async (req, res) => {
     });
   } catch (error) {
     await connection.rollback();
-    console.error('[ocs-service] bundle activation failed', { msisdn, offerCode, error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] bundle activation failed`, { msisdn, offerCode, error: error.message });
     return res.status(500).json({ error: 'Bundle activation failed' });
   } finally {
     connection.release();
@@ -523,7 +608,7 @@ app.post('/bundles/activate', async (req, res) => {
 
 app.get('/bundles/:msisdn/active', async (req, res) => {
   const { msisdn } = req.params;
-  console.log('[ocs-service] active bundles request', { msisdn });
+  logWithCorrelation(req.correlationId, 'active bundles request', { msisdn });
 
   try {
     const bundles = await getActiveBundles(msisdn);
@@ -533,13 +618,13 @@ app.get('/bundles/:msisdn/active', async (req, res) => {
       bundles,
     });
   } catch (error) {
-    console.error('[ocs-service] active bundles lookup failed', { msisdn, error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] active bundles lookup failed`, { msisdn, error: error.message });
     return res.status(500).json({ error: 'OCS service error' });
   }
 });
 
 app.post('/reset-balances', async (req, res) => {
-  console.log('[ocs-service] resetting OCS state to initial state');
+  logWithCorrelation(req.correlationId, 'resetting OCS state to initial state');
 
   const connection = await pool.getConnection();
   try {
@@ -559,7 +644,7 @@ app.post('/reset-balances', async (req, res) => {
     return res.json({ status: 'reset', balances });
   } catch (error) {
     await connection.rollback();
-    console.error('[ocs-service] reset balances failed', { error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] reset balances failed`, { error: error.message });
     return res.status(500).json({ error: 'OCS service error' });
   } finally {
     connection.release();
@@ -568,7 +653,7 @@ app.post('/reset-balances', async (req, res) => {
 
 app.get('/transactions/:msisdn', async (req, res) => {
   const { msisdn } = req.params;
-  console.log('[ocs-service] transaction history request', { msisdn });
+  logWithCorrelation(req.correlationId, 'transaction history request', { msisdn });
 
   try {
     const [transactions] = await pool.query(
@@ -582,7 +667,7 @@ app.get('/transactions/:msisdn', async (req, res) => {
       transactions,
     });
   } catch (error) {
-    console.error('[ocs-service] transaction history failed', { msisdn, error: error.message });
+    console.error(`[ocs-service] [correlationId=${req.correlationId}] transaction history failed`, { msisdn, error: error.message });
     return res.status(500).json({ error: 'OCS service error' });
   }
 });

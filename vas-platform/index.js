@@ -1,8 +1,7 @@
 const express = require('express');
+const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3002;
-
-app.use(express.json());
 
 const startedAt = Date.now();
 const INTERNET_BUNDLE_OFFER_CODE = 'BUNDLE_1GB';
@@ -12,6 +11,47 @@ const NEWS_CATEGORY = 'GENERAL_NEWS';
 const NEWS_OFFER_NAME = 'General News Alerts';
 const NEWS_PRICE = 1;
 
+function createCorrelationId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getCorrelationId(req) {
+  const incomingCorrelationId = req.headers['x-correlation-id'];
+  if (Array.isArray(incomingCorrelationId)) {
+    return incomingCorrelationId[0] || createCorrelationId();
+  }
+
+  return incomingCorrelationId || createCorrelationId();
+}
+
+function logWithCorrelation(correlationId, message, extra = {}) {
+  if (Object.keys(extra).length > 0) {
+    console.log(`[vas-platform] [correlationId=${correlationId}] ${message}`, extra);
+    return;
+  }
+
+  console.log(`[vas-platform] [correlationId=${correlationId}] ${message}`);
+}
+
+function addCorrelationToJsonResponse(req, res) {
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    const responseBody = body
+      && typeof body === 'object'
+      && !Array.isArray(body)
+      && !Object.prototype.hasOwnProperty.call(body, 'correlationId')
+      ? { ...body, correlationId: req.correlationId }
+      : body;
+
+    logWithCorrelation(req.correlationId, 'final response returned', { status: res.statusCode });
+    return originalJson(responseBody);
+  };
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMessage = 'Request timeout') {
   return Promise.race([
     fetch(url, options),
@@ -19,10 +59,10 @@ async function fetchWithTimeout(url, options = {}, timeoutMessage = 'Request tim
   ]);
 }
 
-async function checkDependencyHealth(url) {
+async function checkDependencyHealth(url, correlationId) {
   try {
     const response = await Promise.race([
-      fetch(url),
+      fetch(url, { headers: { 'X-Correlation-ID': correlationId } }),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Health check timeout')), 2000)),
     ]);
 
@@ -73,16 +113,21 @@ function formatActiveBundles(bundles) {
 }
 
 app.use((req, res, next) => {
-  console.log(`[vas-platform] ${req.method} ${req.url}`);
+  req.correlationId = getCorrelationId(req);
+  res.setHeader('X-Correlation-ID', req.correlationId);
+  addCorrelationToJsonResponse(req, res);
+  logWithCorrelation(req.correlationId, `${req.method} ${req.url}`);
   next();
 });
 
+app.use(express.json());
+
 app.get('/health', async (req, res) => {
   const [crmService, ocsService, aggregatorService, smscService] = await Promise.all([
-    checkDependencyHealth('http://crm-service:3003/health'),
-    checkDependencyHealth('http://ocs-service:3004/health'),
-    checkDependencyHealth('http://aggregator-service:3006/health'),
-    checkDependencyHealth('http://smsc-service:3005/health'),
+    checkDependencyHealth('http://crm-service:3003/health', req.correlationId),
+    checkDependencyHealth('http://ocs-service:3004/health', req.correlationId),
+    checkDependencyHealth('http://aggregator-service:3006/health', req.correlationId),
+    checkDependencyHealth('http://smsc-service:3005/health', req.correlationId),
   ]);
 
   const components = {
@@ -106,10 +151,10 @@ app.get('/health', async (req, res) => {
 
 app.post('/ussd', async (req, res) => {
   const { msisdn, sessionId, ussdCode, text, simulateFailure } = req.body;
-  console.log('[vas-platform] received request', { sessionId, msisdn, ussdCode, text, simulateFailure });
+  logWithCorrelation(req.correlationId, 'received /ussd request', { sessionId, msisdn, ussdCode, text, simulateFailure });
 
   if (!msisdn || !sessionId || !ussdCode || typeof text !== 'string') {
-    console.log('[vas-platform] invalid payload', { sessionId });
+    logWithCorrelation(req.correlationId, 'invalid /ussd payload', { sessionId });
     return res.status(400).json({ error: 'Invalid ussd request payload' });
   }
 
@@ -120,25 +165,25 @@ app.post('/ussd', async (req, res) => {
   const activationFailure = simulateFailure === 'BUNDLE_ACTIVATION_FAILED' ? 'ocs-activation-500' : null;
 
   async function fetchActiveBundles() {
-    console.log('[vas-platform] calling OCS active bundles', { sessionId, msisdn });
+    logWithCorrelation(req.correlationId, 'calling OCS active bundles', { sessionId, msisdn });
     const activeBundlesResponse = await fetchWithTimeout(
       `http://ocs-service:3004/bundles/${encodeURIComponent(msisdn)}/active`,
-      {},
+      { headers: { 'X-Correlation-ID': req.correlationId } },
       'OCS active bundles timeout'
     ).catch(err => err);
 
     if (activeBundlesResponse instanceof Error) {
-      console.log('[vas-platform] OCS active bundles failed', { sessionId, error: activeBundlesResponse.message });
+      logWithCorrelation(req.correlationId, 'OCS active bundles failed', { sessionId, error: activeBundlesResponse.message });
       return { error: activeBundlesResponse };
     }
 
     if (!activeBundlesResponse.ok) {
-      console.log('[vas-platform] OCS active bundles error', { sessionId, status: activeBundlesResponse.status });
+      logWithCorrelation(req.correlationId, 'OCS active bundles error', { sessionId, status: activeBundlesResponse.status });
       return { error: new Error('OCS active bundles error') };
     }
 
     const activeBundlesData = await activeBundlesResponse.json();
-    console.log('[vas-platform] OCS active bundles response', {
+    logWithCorrelation(req.correlationId, 'OCS active bundles response', {
       sessionId,
       status: activeBundlesResponse.status,
       count: activeBundlesData.count,
@@ -147,7 +192,7 @@ app.post('/ussd', async (req, res) => {
   }
 
   async function refundCharge(chargeData, reason, amount = INTERNET_BUNDLE_PRICE) {
-    console.log('[vas-platform] calling OCS refund', {
+    logWithCorrelation(req.correlationId, 'calling OCS refund', {
       sessionId,
       msisdn,
       amount,
@@ -159,7 +204,10 @@ app.post('/ussd', async (req, res) => {
       'http://ocs-service:3004/refund',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Correlation-ID': req.correlationId,
+        },
         body: JSON.stringify({
           msisdn,
           amount,
@@ -171,40 +219,40 @@ app.post('/ussd', async (req, res) => {
     ).catch(err => err);
 
     if (refundResponse instanceof Error) {
-      console.log('[vas-platform] OCS refund failed', { sessionId, error: refundResponse.message });
+      logWithCorrelation(req.correlationId, 'OCS refund failed', { sessionId, error: refundResponse.message });
       return { status: 'REFUND_FAILED' };
     }
 
     if (!refundResponse.ok) {
-      console.log('[vas-platform] OCS refund error', { sessionId, status: refundResponse.status });
+      logWithCorrelation(req.correlationId, 'OCS refund error', { sessionId, status: refundResponse.status });
       return { status: 'REFUND_FAILED' };
     }
 
     const refundData = await refundResponse.json();
-    console.log('[vas-platform] OCS refund response', { sessionId, status: refundResponse.status, refundStatus: refundData.status });
+    logWithCorrelation(req.correlationId, 'OCS refund response', { sessionId, status: refundResponse.status, refundStatus: refundData.status });
     return refundData;
   }
 
   async function fetchNewsSubscriptions(category = NEWS_CATEGORY) {
-    console.log('[vas-platform] calling Aggregator subscription lookup', { sessionId, msisdn, category });
+    logWithCorrelation(req.correlationId, 'calling Aggregator subscription lookup', { sessionId, msisdn, category });
     const subscriptionsResponse = await fetchWithTimeout(
       `http://aggregator-service:3006/subscriptions/${encodeURIComponent(msisdn)}?category=${encodeURIComponent(category)}`,
-      {},
+      { headers: { 'X-Correlation-ID': req.correlationId } },
       'Aggregator subscription lookup timeout'
     ).catch(err => err);
 
     if (subscriptionsResponse instanceof Error) {
-      console.log('[vas-platform] Aggregator subscription lookup failed', { sessionId, error: subscriptionsResponse.message });
+      logWithCorrelation(req.correlationId, 'Aggregator subscription lookup failed', { sessionId, error: subscriptionsResponse.message });
       return { error: subscriptionsResponse };
     }
 
     if (!subscriptionsResponse.ok) {
-      console.log('[vas-platform] Aggregator subscription lookup error', { sessionId, status: subscriptionsResponse.status });
+      logWithCorrelation(req.correlationId, 'Aggregator subscription lookup error', { sessionId, status: subscriptionsResponse.status });
       return { error: new Error('Aggregator subscription lookup error') };
     }
 
     const subscriptionsData = await subscriptionsResponse.json();
-    console.log('[vas-platform] Aggregator subscription lookup response', {
+    logWithCorrelation(req.correlationId, 'Aggregator subscription lookup response', {
       sessionId,
       status: subscriptionsResponse.status,
       count: subscriptionsData.count,
@@ -213,15 +261,15 @@ app.post('/ussd', async (req, res) => {
   }
 
   try {
-    console.log('[vas-platform] calling CRM', { sessionId, msisdn, simulateFailure });
+    logWithCorrelation(req.correlationId, 'calling CRM subscriber lookup', { sessionId, msisdn, simulateFailure });
     const crmResponse = await fetchWithTimeout(
       `http://crm-service:3003/subscribers/${encodeURIComponent(msisdn)}${buildFailureQs(crmFailure)}`,
-      {},
+      { headers: { 'X-Correlation-ID': req.correlationId } },
       'CRM timeout'
     ).catch(err => err);
 
     if (crmResponse instanceof Error) {
-      console.log('[vas-platform] CRM failed', { sessionId, error: crmResponse.message });
+      logWithCorrelation(req.correlationId, 'CRM failed', { sessionId, error: crmResponse.message });
       const message = 'Service temporarily unavailable. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message, reason: 'crm_failure' });
       return res.json({ sessionId, continueSession: false, message });
@@ -234,14 +282,14 @@ app.post('/ussd', async (req, res) => {
     }
 
     if (!crmResponse.ok) {
-      console.log('[vas-platform] CRM error', { sessionId, status: crmResponse.status });
+      logWithCorrelation(req.correlationId, 'CRM error', { sessionId, status: crmResponse.status });
       const message = 'Service temporarily unavailable. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message, reason: 'crm_error' });
       return res.json({ sessionId, continueSession: false, message });
     }
 
     const crmData = await crmResponse.json();
-    console.log('[vas-platform] CRM response', { sessionId, status: crmData.status, crmData });
+    logWithCorrelation(req.correlationId, 'CRM response', { sessionId, status: crmData.status, crmData });
 
     if (simulateFailure === 'SUBSCRIBER_NOT_ACTIVE') {
       const message = 'Your subscription is suspended. Please contact support.';
@@ -261,15 +309,15 @@ app.post('/ussd', async (req, res) => {
       return res.json({ sessionId, continueSession: false, message });
     }
 
-    console.log('[vas-platform] calling OCS balance', { sessionId, msisdn, simulateFailure });
+    logWithCorrelation(req.correlationId, 'calling OCS balance', { sessionId, msisdn, simulateFailure });
     const ocsResponse = await fetchWithTimeout(
       `http://ocs-service:3004/balance/${encodeURIComponent(msisdn)}${buildFailureQs(ocsFailure)}`,
-      {},
+      { headers: { 'X-Correlation-ID': req.correlationId } },
       'OCS timeout'
     ).catch(err => err);
 
     if (ocsResponse instanceof Error) {
-      console.log('[vas-platform] OCS failed', { sessionId, error: ocsResponse.message });
+      logWithCorrelation(req.correlationId, 'OCS failed', { sessionId, error: ocsResponse.message });
       const message = 'Unable to check or charge your balance right now. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message, reason: 'ocs_failure' });
       return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
@@ -282,14 +330,14 @@ app.post('/ussd', async (req, res) => {
     }
 
     if (!ocsResponse.ok) {
-      console.log('[vas-platform] OCS error', { sessionId, status: ocsResponse.status });
+      logWithCorrelation(req.correlationId, 'OCS error', { sessionId, status: ocsResponse.status });
       const message = 'Unable to check or charge your balance right now. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message, reason: 'ocs_error' });
       return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
     }
 
     const ocsData = await ocsResponse.json();
-    console.log('[vas-platform] OCS balance response', { sessionId, status: ocsResponse.status, ocsData });
+    logWithCorrelation(req.correlationId, 'OCS balance response', { sessionId, status: ocsResponse.status, ocsData });
 
     const balance = ocsData.balance;
 
@@ -325,7 +373,7 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
-      console.log('[vas-platform] charging account through OCS for news subscription', {
+      logWithCorrelation(req.correlationId, 'charging account through OCS for news subscription', {
         sessionId,
         msisdn,
         amount: NEWS_PRICE,
@@ -336,28 +384,31 @@ app.post('/ussd', async (req, res) => {
         'http://ocs-service:3004/charge',
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Correlation-ID': req.correlationId,
+          },
           body: JSON.stringify({ msisdn, amount: NEWS_PRICE, simulateFailure: ocsFailure }),
         },
         'OCS charge timeout'
       ).catch(err => err);
 
       if (chargeResponse instanceof Error) {
-        console.log('[vas-platform] News charge failed', { sessionId, error: chargeResponse.message });
+        logWithCorrelation(req.correlationId, 'News charge failed', { sessionId, error: chargeResponse.message });
         const message = 'Unable to charge your balance right now. Please try again later.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'news_charge_failure' });
         return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
       }
 
       if (!chargeResponse.ok || chargeResponse.status >= 400) {
-        console.log('[vas-platform] News charge error', { sessionId, status: chargeResponse.status });
+        logWithCorrelation(req.correlationId, 'News charge error', { sessionId, status: chargeResponse.status });
         const message = 'Unable to charge your balance right now. Please try again later.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'news_charge_error' });
         return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
       }
 
       const chargeData = await chargeResponse.json();
-      console.log('[vas-platform] OCS news charge response', { sessionId, status: chargeResponse.status, chargeData });
+      logWithCorrelation(req.correlationId, 'OCS news charge response', { sessionId, status: chargeResponse.status, chargeData });
 
       if (chargeData.status !== 'CHARGED') {
         const message = 'Unable to charge your balance right now. Please try again later.';
@@ -366,7 +417,7 @@ app.post('/ussd', async (req, res) => {
       }
 
       const aggregatorFailure = simulateFailure === 'NEWS_SUBSCRIPTION_FAILED' ? 'aggregator-500' : null;
-      console.log('[vas-platform] calling Aggregator subscription', {
+      logWithCorrelation(req.correlationId, 'calling Aggregator subscription', {
         sessionId,
         msisdn,
         category: NEWS_CATEGORY,
@@ -376,7 +427,10 @@ app.post('/ussd', async (req, res) => {
         'http://aggregator-service:3006/subscriptions',
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Correlation-ID': req.correlationId,
+          },
           body: JSON.stringify({
             msisdn,
             category: NEWS_CATEGORY,
@@ -388,7 +442,7 @@ app.post('/ussd', async (req, res) => {
       ).catch(err => err);
 
       if (subscriptionResponse instanceof Error || !subscriptionResponse.ok || subscriptionResponse.status >= 400) {
-        console.log('[vas-platform] Aggregator subscription failed after charge', {
+        logWithCorrelation(req.correlationId, 'Aggregator subscription failed after charge', {
           sessionId,
           error: subscriptionResponse instanceof Error ? subscriptionResponse.message : subscriptionResponse.status,
         });
@@ -401,7 +455,7 @@ app.post('/ussd', async (req, res) => {
       }
 
       const subscriptionData = await subscriptionResponse.json();
-      console.log('[vas-platform] Aggregator subscription response', {
+      logWithCorrelation(req.correlationId, 'Aggregator subscription response', {
         sessionId,
         status: subscriptionResponse.status,
         providerStatus: subscriptionData.providerStatus,
@@ -417,29 +471,32 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
-      console.log('[vas-platform] calling SMSC', { sessionId, msisdn, message: `You have subscribed to ${NEWS_OFFER_NAME}.`, simulateFailure });
+      logWithCorrelation(req.correlationId, 'calling SMSC', { sessionId, msisdn, message: `You have subscribed to ${NEWS_OFFER_NAME}.`, simulateFailure });
       const smsResponse = await fetchWithTimeout(
         'http://smsc-service:3005/send-sms',
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Correlation-ID': req.correlationId,
+          },
           body: JSON.stringify({ msisdn, message: `You have subscribed to ${NEWS_OFFER_NAME}.`, simulateFailure }),
         },
         'SMSC timeout'
       ).catch(err => err);
 
       if (smsResponse instanceof Error || !smsResponse.ok || smsResponse.status >= 400) {
-        console.log('[vas-platform] SMSC failed but news subscription succeeded', { sessionId, error: smsResponse instanceof Error ? smsResponse.message : smsResponse.status });
+        logWithCorrelation(req.correlationId, 'SMSC failed but news subscription succeeded', { sessionId, error: smsResponse instanceof Error ? smsResponse.message : smsResponse.status });
         const message = 'News alerts subscription successful, but SMS confirmation could not be sent.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'smsc_failure_post_news_subscription' });
         return res.json({ sessionId, continueSession: false, message });
       }
 
       const smsData = await smsResponse.json();
-      console.log('[vas-platform] SMSC response', { sessionId, status: smsResponse.status, smsData });
+      logWithCorrelation(req.correlationId, 'SMSC response', { sessionId, status: smsResponse.status, smsData });
 
       if (smsData.deliveryStatus !== 'DELIVERED') {
-        console.log('[vas-platform] SMS not delivered', { sessionId, smsData });
+        logWithCorrelation(req.correlationId, 'SMS not delivered', { sessionId, smsData });
         const message = 'News alerts subscription successful, but SMS confirmation could not be sent.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'sms_not_delivered_post_news_subscription' });
         return res.json({ sessionId, continueSession: false, message });
@@ -492,7 +549,7 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
-      console.log('[vas-platform] charging account through OCS', {
+      logWithCorrelation(req.correlationId, 'charging account through OCS', {
         sessionId,
         msisdn,
         amount: INTERNET_BUNDLE_PRICE,
@@ -502,28 +559,31 @@ app.post('/ussd', async (req, res) => {
         'http://ocs-service:3004/charge',
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Correlation-ID': req.correlationId,
+          },
           body: JSON.stringify({ msisdn, amount: INTERNET_BUNDLE_PRICE, simulateFailure: ocsFailure }),
         },
         'OCS charge timeout'
       ).catch(err => err);
 
       if (chargeResponse instanceof Error) {
-        console.log('[vas-platform] Charge failed', { sessionId, error: chargeResponse.message });
+        logWithCorrelation(req.correlationId, 'Charge failed', { sessionId, error: chargeResponse.message });
         const message = 'Unable to check or charge your balance right now. Please try again later.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'charge_failure' });
         return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
       }
 
       if (!chargeResponse.ok || chargeResponse.status >= 400) {
-        console.log('[vas-platform] Charge error', { sessionId, status: chargeResponse.status });
+        logWithCorrelation(req.correlationId, 'Charge error', { sessionId, status: chargeResponse.status });
         const message = 'Unable to check or charge your balance right now. Please try again later.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'charge_error' });
         return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
       }
 
       const chargeData = await chargeResponse.json();
-      console.log('[vas-platform] OCS charge response', { sessionId, status: chargeResponse.status, chargeData });
+      logWithCorrelation(req.correlationId, 'OCS charge response', { sessionId, status: chargeResponse.status, chargeData });
 
       if (chargeData.status !== 'CHARGED') {
         const message = 'Unable to check or charge your balance right now. Please try again later.';
@@ -531,7 +591,7 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
-      console.log('[vas-platform] activating internet bundle through OCS', {
+      logWithCorrelation(req.correlationId, 'activating internet bundle through OCS', {
         sessionId,
         msisdn,
         offerCode: INTERNET_BUNDLE_OFFER_CODE,
@@ -541,7 +601,10 @@ app.post('/ussd', async (req, res) => {
         'http://ocs-service:3004/bundles/activate',
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Correlation-ID': req.correlationId,
+          },
           body: JSON.stringify({
             msisdn,
             offerCode: INTERNET_BUNDLE_OFFER_CODE,
@@ -553,7 +616,7 @@ app.post('/ussd', async (req, res) => {
       ).catch(err => err);
 
       if (activationResponse instanceof Error || !activationResponse.ok || activationResponse.status >= 400) {
-        console.log('[vas-platform] OCS bundle activation failed after charge', {
+        logWithCorrelation(req.correlationId, 'OCS bundle activation failed after charge', {
           sessionId,
           error: activationResponse instanceof Error ? activationResponse.message : activationResponse.status,
         });
@@ -566,7 +629,7 @@ app.post('/ussd', async (req, res) => {
       }
 
       const activationData = await activationResponse.json();
-      console.log('[vas-platform] OCS bundle activation response', {
+      logWithCorrelation(req.correlationId, 'OCS bundle activation response', {
         sessionId,
         status: activationResponse.status,
         activationStatus: activationData.status,
@@ -582,29 +645,32 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
-      console.log('[vas-platform] calling SMSC', { sessionId, msisdn, message: 'Your 1GB bundle has been activated.', simulateFailure });
+      logWithCorrelation(req.correlationId, 'calling SMSC', { sessionId, msisdn, message: 'Your 1GB bundle has been activated.', simulateFailure });
       const smsResponse = await fetchWithTimeout(
         'http://smsc-service:3005/send-sms',
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Correlation-ID': req.correlationId,
+          },
           body: JSON.stringify({ msisdn, message: 'Your 1GB bundle has been activated.', simulateFailure }),
         },
         'SMSC timeout'
       ).catch(err => err);
 
       if (smsResponse instanceof Error || !smsResponse.ok || smsResponse.status >= 400) {
-        console.log('[vas-platform] SMSC failed but purchase succeeded', { sessionId, error: smsResponse instanceof Error ? smsResponse.message : smsResponse.status });
+        logWithCorrelation(req.correlationId, 'SMSC failed but purchase succeeded', { sessionId, error: smsResponse instanceof Error ? smsResponse.message : smsResponse.status });
         const message = 'Bundle purchase successful, but SMS confirmation could not be sent.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'smsc_failure_post_purchase' });
         return res.json({ sessionId, continueSession: false, message });
       }
 
       const smsData = await smsResponse.json();
-      console.log('[vas-platform] SMSC response', { sessionId, status: smsResponse.status, smsData });
+      logWithCorrelation(req.correlationId, 'SMSC response', { sessionId, status: smsResponse.status, smsData });
 
       if (smsData.deliveryStatus !== 'DELIVERED') {
-        console.log('[vas-platform] SMS not delivered', { sessionId, smsData });
+        logWithCorrelation(req.correlationId, 'SMS not delivered', { sessionId, smsData });
         const message = 'Bundle purchase successful, but SMS confirmation could not be sent.';
         console.log('[vas-platform] final response', { sessionId, message, reason: 'sms_not_delivered' });
         return res.json({ sessionId, continueSession: false, message });
@@ -619,7 +685,7 @@ app.post('/ussd', async (req, res) => {
     console.log('[vas-platform] final response', { sessionId, message });
     return res.json({ sessionId, continueSession: true, message });
   } catch (error) {
-    console.error('[vas-platform] error processing ussd', { sessionId, error: error.message });
+    console.error(`[vas-platform] [correlationId=${req.correlationId}] error processing ussd`, { sessionId, error: error.message });
     const message = 'Service temporarily unavailable. Please try again later.';
     console.log('[vas-platform] final response', { sessionId, message, reason: 'uncaught_error' });
     return res.json({ sessionId, continueSession: false, message });

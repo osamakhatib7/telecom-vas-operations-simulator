@@ -1,10 +1,9 @@
 const express = require('express');
+const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 const app = express();
 const PORT = process.env.PORT || 3006;
-
-app.use(express.json());
 
 const initialContentOffers = [
   {
@@ -29,10 +28,56 @@ const dbConfig = {
 
 let pool;
 
+function createCorrelationId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getCorrelationId(req) {
+  const incomingCorrelationId = req.headers['x-correlation-id'];
+  if (Array.isArray(incomingCorrelationId)) {
+    return incomingCorrelationId[0] || createCorrelationId();
+  }
+
+  return incomingCorrelationId || createCorrelationId();
+}
+
+function logWithCorrelation(correlationId, message, extra = {}) {
+  if (Object.keys(extra).length > 0) {
+    console.log(`[aggregator-service] [correlationId=${correlationId}] ${message}`, extra);
+    return;
+  }
+
+  console.log(`[aggregator-service] [correlationId=${correlationId}] ${message}`);
+}
+
+function addCorrelationToJsonResponse(req, res) {
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    const responseBody = body
+      && typeof body === 'object'
+      && !Array.isArray(body)
+      && !Object.prototype.hasOwnProperty.call(body, 'correlationId')
+      ? { ...body, correlationId: req.correlationId }
+      : body;
+
+    logWithCorrelation(req.correlationId, 'final response returned', { status: res.statusCode });
+    return originalJson(responseBody);
+  };
+}
+
 app.use((req, res, next) => {
-  console.log(`[aggregator-service] ${req.method} ${req.url}`);
+  req.correlationId = getCorrelationId(req);
+  res.setHeader('X-Correlation-ID', req.correlationId);
+  addCorrelationToJsonResponse(req, res);
+  logWithCorrelation(req.correlationId, `${req.method} ${req.url}`);
   next();
 });
+
+app.use(express.json());
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -167,7 +212,7 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     return res.json({ status: 'ok', service: 'aggregator-service', database: 'UP' });
   } catch (error) {
-    console.error('[aggregator-service] health check failed', { error: error.message });
+    console.error(`[aggregator-service] [correlationId=${req.correlationId}] health check failed`, { error: error.message });
     return res.status(500).json({ status: 'error', service: 'aggregator-service', database: 'DOWN' });
   }
 });
@@ -175,7 +220,7 @@ app.get('/health', async (req, res) => {
 app.get('/subscriptions/:msisdn', async (req, res) => {
   const { msisdn } = req.params;
   const { category } = req.query;
-  console.log('[aggregator-service] subscription lookup', { msisdn, category });
+  logWithCorrelation(req.correlationId, 'subscription lookup', { msisdn, category });
 
   try {
     const activeSubscriptions = await getActiveSubscriptions(msisdn, category);
@@ -185,22 +230,22 @@ app.get('/subscriptions/:msisdn', async (req, res) => {
       subscriptions: activeSubscriptions,
     });
   } catch (error) {
-    console.error('[aggregator-service] subscription lookup failed', { msisdn, category, error: error.message });
+    console.error(`[aggregator-service] [correlationId=${req.correlationId}] subscription lookup failed`, { msisdn, category, error: error.message });
     return res.status(500).json({ error: 'Aggregator subscription lookup error' });
   }
 });
 
 app.post('/subscriptions', async (req, res) => {
   const { msisdn, category = 'GENERAL_NEWS', referenceId, simulateFailure } = req.body;
-  console.log('[aggregator-service] subscription request', { msisdn, category, referenceId, simulateFailure });
+  logWithCorrelation(req.correlationId, 'subscription request', { msisdn, category, referenceId, simulateFailure });
 
   if (simulateFailure === 'aggregator-timeout') {
-    console.log('[aggregator-service] simulating subscription timeout', { msisdn, category });
+    logWithCorrelation(req.correlationId, 'simulating subscription timeout', { msisdn, category });
     return;
   }
 
   if (simulateFailure === 'aggregator-500') {
-    console.log('[aggregator-service] simulating subscription error', { msisdn, category });
+    logWithCorrelation(req.correlationId, 'simulating subscription error', { msisdn, category });
     return res.status(500).json({ error: 'Aggregator subscription error' });
   }
 
@@ -229,7 +274,7 @@ app.post('/subscriptions', async (req, res) => {
     );
 
     if (existingSubscriptions.length > 0) {
-      console.log('[aggregator-service] duplicate subscription rejected', { msisdn, category });
+      logWithCorrelation(req.correlationId, 'duplicate subscription rejected', { msisdn, category });
       await connection.commit();
       return res.status(409).json({
         providerStatus: 'ALREADY_ACTIVE',
@@ -272,7 +317,7 @@ app.post('/subscriptions', async (req, res) => {
       validUntil,
     };
 
-    console.log('[aggregator-service] subscription created', {
+    logWithCorrelation(req.correlationId, 'subscription created', {
       msisdn,
       category,
       providerReference,
@@ -285,7 +330,7 @@ app.post('/subscriptions', async (req, res) => {
     });
   } catch (error) {
     await connection.rollback();
-    console.error('[aggregator-service] subscription failed', { msisdn, category, error: error.message });
+    console.error(`[aggregator-service] [correlationId=${req.correlationId}] subscription failed`, { msisdn, category, error: error.message });
     return res.status(500).json({ error: 'Aggregator subscription error' });
   } finally {
     connection.release();
