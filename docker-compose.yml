@@ -33,6 +33,15 @@ services:
     build: ./crm-service
     ports:
       - "3003:3003"
+    environment:
+      DB_HOST: mysql-db
+      DB_PORT: 3306
+      DB_USER: vas_user
+      DB_PASSWORD: vas_password
+      DB_NAME: vas_lab
+    depends_on:
+      mysql-db:
+        condition: service_healthy
   ocs-service:
     build: ./ocs-service
     ports:
@@ -50,10 +59,28 @@ services:
     build: ./smsc-service
     ports:
       - "3005:3005"
+    environment:
+      DB_HOST: mysql-db
+      DB_PORT: 3306
+      DB_USER: vas_user
+      DB_PASSWORD: vas_password
+      DB_NAME: vas_lab
+    depends_on:
+      mysql-db:
+        condition: service_healthy
   aggregator-service:
     build: ./aggregator-service
     ports:
       - "3006:3006"
+    environment:
+      DB_HOST: mysql-db
+      DB_PORT: 3306
+      DB_USER: vas_user
+      DB_PASSWORD: vas_password
+      DB_NAME: vas_lab
+    depends_on:
+      mysql-db:
+        condition: service_healthy
 
 volumes:
   mysql-data:
