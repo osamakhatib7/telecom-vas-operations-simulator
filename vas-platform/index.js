@@ -8,6 +8,9 @@ const startedAt = Date.now();
 const INTERNET_BUNDLE_OFFER_CODE = 'BUNDLE_1GB';
 const INTERNET_BUNDLE_NAME = '1GB Internet Bundle';
 const INTERNET_BUNDLE_PRICE = 5;
+const NEWS_CATEGORY = 'GENERAL_NEWS';
+const NEWS_OFFER_NAME = 'General News Alerts';
+const NEWS_PRICE = 1;
 
 async function fetchWithTimeout(url, options = {}, timeoutMessage = 'Request timeout') {
   return Promise.race([
@@ -143,11 +146,11 @@ app.post('/ussd', async (req, res) => {
     return { data: activeBundlesData };
   }
 
-  async function refundCharge(chargeData, reason) {
+  async function refundCharge(chargeData, reason, amount = INTERNET_BUNDLE_PRICE) {
     console.log('[vas-platform] calling OCS refund', {
       sessionId,
       msisdn,
-      amount: INTERNET_BUNDLE_PRICE,
+      amount,
       originalReferenceId: chargeData.referenceId,
       reason,
     });
@@ -159,7 +162,7 @@ app.post('/ussd', async (req, res) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           msisdn,
-          amount: INTERNET_BUNDLE_PRICE,
+          amount,
           originalReferenceId: chargeData.referenceId,
           reason,
         }),
@@ -180,6 +183,33 @@ app.post('/ussd', async (req, res) => {
     const refundData = await refundResponse.json();
     console.log('[vas-platform] OCS refund response', { sessionId, status: refundResponse.status, refundStatus: refundData.status });
     return refundData;
+  }
+
+  async function fetchNewsSubscriptions(category = NEWS_CATEGORY) {
+    console.log('[vas-platform] calling Aggregator subscription lookup', { sessionId, msisdn, category });
+    const subscriptionsResponse = await fetchWithTimeout(
+      `http://aggregator-service:3006/subscriptions/${encodeURIComponent(msisdn)}?category=${encodeURIComponent(category)}`,
+      {},
+      'Aggregator subscription lookup timeout'
+    ).catch(err => err);
+
+    if (subscriptionsResponse instanceof Error) {
+      console.log('[vas-platform] Aggregator subscription lookup failed', { sessionId, error: subscriptionsResponse.message });
+      return { error: subscriptionsResponse };
+    }
+
+    if (!subscriptionsResponse.ok) {
+      console.log('[vas-platform] Aggregator subscription lookup error', { sessionId, status: subscriptionsResponse.status });
+      return { error: new Error('Aggregator subscription lookup error') };
+    }
+
+    const subscriptionsData = await subscriptionsResponse.json();
+    console.log('[vas-platform] Aggregator subscription lookup response', {
+      sessionId,
+      status: subscriptionsResponse.status,
+      count: subscriptionsData.count,
+    });
+    return { data: subscriptionsData };
   }
 
   try {
@@ -276,7 +306,146 @@ app.post('/ussd', async (req, res) => {
     }
 
     if (normalizedText === '3') {
-      const message = 'News alerts are not available yet.';
+      const subscriptionsResult = await fetchNewsSubscriptions(NEWS_CATEGORY);
+      if (subscriptionsResult.error) {
+        const message = 'Unable to verify news subscription status. Please try again later.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'news_subscription_precheck_error' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      if ((subscriptionsResult.data.subscriptions || []).length > 0) {
+        const message = `You are already subscribed to ${NEWS_OFFER_NAME}.`;
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'news_subscription_already_active' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      if (balance < NEWS_PRICE) {
+        const message = 'Insufficient balance to subscribe to news alerts';
+        console.log('[vas-platform] final response', { sessionId, message });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      console.log('[vas-platform] charging account through OCS for news subscription', {
+        sessionId,
+        msisdn,
+        amount: NEWS_PRICE,
+        category: NEWS_CATEGORY,
+        simulateFailure,
+      });
+      const chargeResponse = await fetchWithTimeout(
+        'http://ocs-service:3004/charge',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ msisdn, amount: NEWS_PRICE, simulateFailure: ocsFailure }),
+        },
+        'OCS charge timeout'
+      ).catch(err => err);
+
+      if (chargeResponse instanceof Error) {
+        console.log('[vas-platform] News charge failed', { sessionId, error: chargeResponse.message });
+        const message = 'Unable to charge your balance right now. Please try again later.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'news_charge_failure' });
+        return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
+      }
+
+      if (!chargeResponse.ok || chargeResponse.status >= 400) {
+        console.log('[vas-platform] News charge error', { sessionId, status: chargeResponse.status });
+        const message = 'Unable to charge your balance right now. Please try again later.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'news_charge_error' });
+        return res.json({ sessionId, continueSession: false, message, failureReason: simulateFailure === 'BILLING_FAILED' ? 'BILLING_FAILED' : undefined });
+      }
+
+      const chargeData = await chargeResponse.json();
+      console.log('[vas-platform] OCS news charge response', { sessionId, status: chargeResponse.status, chargeData });
+
+      if (chargeData.status !== 'CHARGED') {
+        const message = 'Unable to charge your balance right now. Please try again later.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'news_charge_not_successful' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      const aggregatorFailure = simulateFailure === 'NEWS_SUBSCRIPTION_FAILED' ? 'aggregator-500' : null;
+      console.log('[vas-platform] calling Aggregator subscription', {
+        sessionId,
+        msisdn,
+        category: NEWS_CATEGORY,
+        chargeReferenceId: chargeData.referenceId,
+      });
+      const subscriptionResponse = await fetchWithTimeout(
+        'http://aggregator-service:3006/subscriptions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            msisdn,
+            category: NEWS_CATEGORY,
+            referenceId: chargeData.referenceId,
+            simulateFailure: aggregatorFailure,
+          }),
+        },
+        'Aggregator subscription timeout'
+      ).catch(err => err);
+
+      if (subscriptionResponse instanceof Error || !subscriptionResponse.ok || subscriptionResponse.status >= 400) {
+        console.log('[vas-platform] Aggregator subscription failed after charge', {
+          sessionId,
+          error: subscriptionResponse instanceof Error ? subscriptionResponse.message : subscriptionResponse.status,
+        });
+        const refundData = await refundCharge(chargeData, 'NEWS_SUBSCRIPTION_FAILED_AFTER_CHARGE', NEWS_PRICE);
+        const message = refundData.status === 'REFUNDED'
+          ? 'News subscription could not be completed. Charged amount has been reversed.'
+          : 'News subscription could not be completed. Your transaction has been flagged for reversal.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'news_subscription_failed_post_charge' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      const subscriptionData = await subscriptionResponse.json();
+      console.log('[vas-platform] Aggregator subscription response', {
+        sessionId,
+        status: subscriptionResponse.status,
+        providerStatus: subscriptionData.providerStatus,
+        category: subscriptionData.subscription && subscriptionData.subscription.category,
+      });
+
+      if (subscriptionData.providerStatus !== 'SUCCESS') {
+        const refundData = await refundCharge(chargeData, 'NEWS_SUBSCRIPTION_NOT_SUCCESSFUL_AFTER_CHARGE', NEWS_PRICE);
+        const message = refundData.status === 'REFUNDED'
+          ? 'News subscription could not be completed. Charged amount has been reversed.'
+          : 'News subscription could not be completed. Your transaction has been flagged for reversal.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'news_subscription_not_successful' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      console.log('[vas-platform] calling SMSC', { sessionId, msisdn, message: `You have subscribed to ${NEWS_OFFER_NAME}.`, simulateFailure });
+      const smsResponse = await fetchWithTimeout(
+        'http://smsc-service:3005/send-sms',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ msisdn, message: `You have subscribed to ${NEWS_OFFER_NAME}.`, simulateFailure }),
+        },
+        'SMSC timeout'
+      ).catch(err => err);
+
+      if (smsResponse instanceof Error || !smsResponse.ok || smsResponse.status >= 400) {
+        console.log('[vas-platform] SMSC failed but news subscription succeeded', { sessionId, error: smsResponse instanceof Error ? smsResponse.message : smsResponse.status });
+        const message = 'News alerts subscription successful, but SMS confirmation could not be sent.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'smsc_failure_post_news_subscription' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      const smsData = await smsResponse.json();
+      console.log('[vas-platform] SMSC response', { sessionId, status: smsResponse.status, smsData });
+
+      if (smsData.deliveryStatus !== 'DELIVERED') {
+        console.log('[vas-platform] SMS not delivered', { sessionId, smsData });
+        const message = 'News alerts subscription successful, but SMS confirmation could not be sent.';
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'sms_not_delivered_post_news_subscription' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      const message = 'News alerts subscription successful. Confirmation SMS sent.';
       console.log('[vas-platform] final response', { sessionId, message });
       return res.json({ sessionId, continueSession: false, message });
     }
