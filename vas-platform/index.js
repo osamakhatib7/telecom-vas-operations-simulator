@@ -1,5 +1,6 @@
 const express = require('express');
 const crypto = require('crypto');
+const mysql = require('mysql2/promise');
 const app = express();
 const PORT = process.env.PORT || 3002;
 
@@ -10,6 +11,18 @@ const INTERNET_BUNDLE_PRICE = 5;
 const NEWS_CATEGORY = 'GENERAL_NEWS';
 const NEWS_OFFER_NAME = 'General News Alerts';
 const NEWS_PRICE = 1;
+
+const dbConfig = {
+  host: process.env.DB_HOST || 'mysql-db',
+  port: Number(process.env.DB_PORT || 3306),
+  user: process.env.DB_USER || 'vas_user',
+  password: process.env.DB_PASSWORD || 'vas_password',
+  database: process.env.DB_NAME || 'vas_lab',
+  waitForConnections: true,
+  connectionLimit: 10,
+};
+
+let pool;
 
 function createCorrelationId() {
   if (crypto.randomUUID) {
@@ -49,6 +62,260 @@ function addCorrelationToJsonResponse(req, res) {
 
     logWithCorrelation(req.correlationId, 'final response returned', { status: res.statusCode });
     return originalJson(responseBody);
+  };
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function createPoolWithRetry(maxAttempts = 30, delayMs = 2000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const candidatePool = mysql.createPool(dbConfig);
+      const connection = await candidatePool.getConnection();
+      await connection.ping();
+      connection.release();
+      console.log('[vas-platform] database connection established', { attempt });
+      return candidatePool;
+    } catch (error) {
+      console.log('[vas-platform] waiting for database', { attempt, error: error.message });
+      if (attempt === maxAttempts) {
+        throw error;
+      }
+      await sleep(delayMs);
+    }
+  }
+}
+
+async function ensureSchema() {
+  console.log('[vas-platform] ensuring database schema');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vas_transactions (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      correlation_id VARCHAR(100),
+      session_id VARCHAR(100),
+      msisdn VARCHAR(20),
+      ussd_code VARCHAR(50),
+      input_text TEXT,
+      selected_option VARCHAR(20),
+      flow_name VARCHAR(100),
+      subscriber_status VARCHAR(50),
+      status VARCHAR(50) NOT NULL DEFAULT 'IN_PROGRESS',
+      failure_reason VARCHAR(100),
+      customer_message TEXT,
+      crm_checked BOOLEAN NOT NULL DEFAULT FALSE,
+      ocs_checked BOOLEAN NOT NULL DEFAULT FALSE,
+      aggregator_checked BOOLEAN NOT NULL DEFAULT FALSE,
+      smsc_checked BOOLEAN NOT NULL DEFAULT FALSE,
+      charge_reference_id VARCHAR(100),
+      refund_reference_id VARCHAR(100),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_vas_transactions_created_at (created_at),
+      INDEX idx_vas_transactions_correlation_id (correlation_id),
+      INDEX idx_vas_transactions_session_id (session_id),
+      INDEX idx_vas_transactions_msisdn (msisdn),
+      INDEX idx_vas_transactions_status_flow (status, flow_name)
+    )
+  `);
+}
+
+function getFlowName(normalizedText) {
+  if (normalizedText === null) {
+    return 'INVALID_REQUEST';
+  }
+
+  const flowNames = {
+    '': 'MAIN_MENU',
+    '0': 'MAIN_MENU',
+    '1': 'BUY_INTERNET_BUNDLE',
+    '2': 'CHECK_BALANCE',
+    '3': 'SUBSCRIBE_NEWS_ALERTS',
+    '4': 'CHECK_ACTIVE_BUNDLES',
+    '5': 'EXIT',
+  };
+
+  return flowNames[normalizedText] || 'MAIN_MENU';
+}
+
+function inferFailureReason(message, transaction) {
+  if (!message) {
+    return null;
+  }
+
+  const normalizedMessage = message.toLowerCase();
+
+  if (normalizedMessage.includes('sms confirmation could not be sent')) {
+    return 'SMSC_CONFIRMATION_FAILED';
+  }
+  if (normalizedMessage.includes('already have an active')) {
+    return 'BUNDLE_ALREADY_ACTIVE';
+  }
+  if (normalizedMessage.includes('already subscribed')) {
+    return 'NEWS_ALREADY_SUBSCRIBED';
+  }
+  if (normalizedMessage.includes('insufficient balance')) {
+    return 'INSUFFICIENT_BALANCE';
+  }
+  if (normalizedMessage.includes('suspended')) {
+    return 'SUBSCRIBER_NOT_ACTIVE';
+  }
+  if (normalizedMessage.includes('subscriber not found')) {
+    return 'SUBSCRIBER_NOT_FOUND';
+  }
+  if (normalizedMessage.includes('balance information not found')) {
+    return 'BALANCE_NOT_FOUND';
+  }
+  if (normalizedMessage.includes('bundle purchase could not be completed')) {
+    return transaction.refundReferenceId ? 'BUNDLE_ACTIVATION_FAILED_REVERSED' : 'BUNDLE_ACTIVATION_FAILED';
+  }
+  if (normalizedMessage.includes('news subscription could not be completed')) {
+    return transaction.refundReferenceId ? 'NEWS_SUBSCRIPTION_FAILED_REVERSED' : 'NEWS_SUBSCRIPTION_FAILED';
+  }
+  if (normalizedMessage.includes('unable to verify news subscription')) {
+    return 'AGGREGATOR_PRECHECK_FAILED';
+  }
+  if (normalizedMessage.includes('unable to retrieve active internet bundles')
+    || normalizedMessage.includes('unable to verify active internet bundles')) {
+    return 'OCS_ACTIVE_BUNDLES_FAILED';
+  }
+  if (normalizedMessage.includes('unable to check or charge')
+    || normalizedMessage.includes('unable to charge')) {
+    return transaction.ocsChecked ? 'OCS_FAILURE' : 'BALANCE_OR_CHARGE_FAILURE';
+  }
+  if (normalizedMessage.includes('service temporarily unavailable')) {
+    return transaction.crmChecked ? 'CRM_FAILURE' : 'SERVICE_UNAVAILABLE';
+  }
+
+  return null;
+}
+
+function inferFinalStatus(body, transaction) {
+  if (transaction.status && transaction.status !== 'IN_PROGRESS') {
+    return transaction.status;
+  }
+
+  const message = body && body.message ? body.message : null;
+  if (message && message.toLowerCase().includes('successful, but sms confirmation could not be sent')) {
+    return 'PARTIAL_SUCCESS';
+  }
+
+  if ((body && body.error) || (body && body.failureReason) || inferFailureReason(message, transaction)) {
+    return 'FAILED';
+  }
+
+  return 'SUCCESS';
+}
+
+async function createVasTransaction(req, initial) {
+  try {
+    const [result] = await pool.query(
+      `INSERT INTO vas_transactions
+        (correlation_id, session_id, msisdn, ussd_code, input_text, selected_option, flow_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.correlationId,
+        initial.sessionId || null,
+        initial.msisdn || null,
+        initial.ussdCode || null,
+        initial.inputText,
+        initial.selectedOption,
+        initial.flowName,
+      ]
+    );
+
+    return result.insertId;
+  } catch (error) {
+    console.error(`[vas-platform] [correlationId=${req.correlationId}] failed to create VAS transaction`, { error: error.message });
+    return null;
+  }
+}
+
+async function updateVasTransaction(req, transaction) {
+  if (!transaction.id) {
+    return;
+  }
+
+  try {
+    await pool.query(
+      `UPDATE vas_transactions
+       SET
+        selected_option = ?,
+        flow_name = ?,
+        subscriber_status = ?,
+        status = ?,
+        failure_reason = ?,
+        customer_message = ?,
+        crm_checked = ?,
+        ocs_checked = ?,
+        aggregator_checked = ?,
+        smsc_checked = ?,
+        charge_reference_id = ?,
+        refund_reference_id = ?
+       WHERE id = ?`,
+      [
+        transaction.selectedOption,
+        transaction.flowName,
+        transaction.subscriberStatus,
+        transaction.status,
+        transaction.failureReason,
+        transaction.customerMessage,
+        transaction.crmChecked,
+        transaction.ocsChecked,
+        transaction.aggregatorChecked,
+        transaction.smscChecked,
+        transaction.chargeReferenceId,
+        transaction.refundReferenceId,
+        transaction.id,
+      ]
+    );
+  } catch (error) {
+    console.error(`[vas-platform] [correlationId=${req.correlationId}] failed to update VAS transaction`, {
+      transactionId: transaction.id,
+      error: error.message,
+    });
+  }
+}
+
+function attachVasTransactionFinalizer(req, res, transaction) {
+  const originalJson = res.json.bind(res);
+  res.json = async (body) => {
+    const message = body && body.message ? body.message : null;
+    transaction.customerMessage = message || body && body.error || null;
+    transaction.status = inferFinalStatus(body, transaction);
+    transaction.failureReason = body && body.failureReason
+      ? body.failureReason
+      : transaction.failureReason || inferFailureReason(message, transaction);
+
+    await updateVasTransaction(req, transaction);
+    return originalJson(body);
+  };
+}
+
+function mapVasTransaction(row) {
+  return {
+    id: row.id,
+    correlationId: row.correlationId,
+    sessionId: row.sessionId,
+    msisdn: row.msisdn,
+    ussdCode: row.ussdCode,
+    inputText: row.inputText,
+    selectedOption: row.selectedOption,
+    flowName: row.flowName,
+    subscriberStatus: row.subscriberStatus,
+    status: row.status,
+    failureReason: row.failureReason,
+    customerMessage: row.customerMessage,
+    crmChecked: Boolean(row.crmChecked),
+    ocsChecked: Boolean(row.ocsChecked),
+    aggregatorChecked: Boolean(row.aggregatorChecked),
+    smscChecked: Boolean(row.smscChecked),
+    chargeReferenceId: row.chargeReferenceId,
+    refundReferenceId: row.refundReferenceId,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 
@@ -129,6 +396,13 @@ app.get('/health', async (req, res) => {
     checkDependencyHealth('http://aggregator-service:3006/health', req.correlationId),
     checkDependencyHealth('http://smsc-service:3005/health', req.correlationId),
   ]);
+  let database = 'UP';
+  try {
+    await pool.query('SELECT 1');
+  } catch (error) {
+    database = 'DOWN';
+    console.error(`[vas-platform] [correlationId=${req.correlationId}] health check database error`, { error: error.message });
+  }
 
   const components = {
     vasService: 'UP',
@@ -136,6 +410,7 @@ app.get('/health', async (req, res) => {
     ocsService,
     aggregatorService,
     smscService,
+    database,
   };
 
   const allDependenciesUp = Object.values(components).every(status => status === 'UP');
@@ -149,22 +424,164 @@ app.get('/health', async (req, res) => {
   });
 });
 
+app.get('/transactions', async (req, res) => {
+  const { msisdn, correlationId, sessionId, status, flowName } = req.query;
+  const conditions = [];
+  const params = [];
+
+  if (msisdn) {
+    conditions.push('msisdn = ?');
+    params.push(msisdn);
+  }
+  if (correlationId) {
+    conditions.push('correlation_id = ?');
+    params.push(correlationId);
+  }
+  if (sessionId) {
+    conditions.push('session_id = ?');
+    params.push(sessionId);
+  }
+  if (status) {
+    conditions.push('status = ?');
+    params.push(status);
+  }
+  if (flowName) {
+    conditions.push('flow_name = ?');
+    params.push(flowName);
+  }
+
+  const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  try {
+    const [rows] = await pool.query(
+      `SELECT
+        id,
+        correlation_id AS correlationId,
+        session_id AS sessionId,
+        msisdn,
+        ussd_code AS ussdCode,
+        input_text AS inputText,
+        selected_option AS selectedOption,
+        flow_name AS flowName,
+        subscriber_status AS subscriberStatus,
+        status,
+        failure_reason AS failureReason,
+        customer_message AS customerMessage,
+        crm_checked AS crmChecked,
+        ocs_checked AS ocsChecked,
+        aggregator_checked AS aggregatorChecked,
+        smsc_checked AS smscChecked,
+        charge_reference_id AS chargeReferenceId,
+        refund_reference_id AS refundReferenceId,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+       FROM vas_transactions
+       ${whereClause}
+       ORDER BY created_at DESC, id DESC`,
+      params
+    );
+
+    return res.json({
+      count: rows.length,
+      transactions: rows.map(mapVasTransaction),
+    });
+  } catch (error) {
+    console.error(`[vas-platform] [correlationId=${req.correlationId}] VAS transaction query failed`, { error: error.message });
+    return res.status(500).json({ error: 'Failed to read VAS transactions' });
+  }
+});
+
+app.get('/transactions/:correlationId', async (req, res) => {
+  const { correlationId } = req.params;
+
+  try {
+    const [rows] = await pool.query(
+      `SELECT
+        id,
+        correlation_id AS correlationId,
+        session_id AS sessionId,
+        msisdn,
+        ussd_code AS ussdCode,
+        input_text AS inputText,
+        selected_option AS selectedOption,
+        flow_name AS flowName,
+        subscriber_status AS subscriberStatus,
+        status,
+        failure_reason AS failureReason,
+        customer_message AS customerMessage,
+        crm_checked AS crmChecked,
+        ocs_checked AS ocsChecked,
+        aggregator_checked AS aggregatorChecked,
+        smsc_checked AS smscChecked,
+        charge_reference_id AS chargeReferenceId,
+        refund_reference_id AS refundReferenceId,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+       FROM vas_transactions
+       WHERE correlation_id = ?
+       ORDER BY created_at DESC, id DESC`,
+      [correlationId]
+    );
+
+    return res.json({
+      count: rows.length,
+      transactions: rows.map(mapVasTransaction),
+    });
+  } catch (error) {
+    console.error(`[vas-platform] [correlationId=${req.correlationId}] VAS transaction lookup failed`, {
+      requestedCorrelationId: correlationId,
+      error: error.message,
+    });
+    return res.status(500).json({ error: 'Failed to read VAS transactions' });
+  }
+});
+
 app.post('/ussd', async (req, res) => {
   const { msisdn, sessionId, ussdCode, text, simulateFailure } = req.body;
   logWithCorrelation(req.correlationId, 'received /ussd request', { sessionId, msisdn, ussdCode, text, simulateFailure });
 
+  const inputText = typeof text === 'string' ? text : null;
+  const normalizedText = inputText !== null ? inputText.trim() : null;
+  const vasTransaction = {
+    id: null,
+    selectedOption: normalizedText,
+    flowName: getFlowName(normalizedText),
+    subscriberStatus: null,
+    status: 'IN_PROGRESS',
+    failureReason: null,
+    customerMessage: null,
+    crmChecked: false,
+    ocsChecked: false,
+    aggregatorChecked: false,
+    smscChecked: false,
+    chargeReferenceId: null,
+    refundReferenceId: null,
+  };
+
+  vasTransaction.id = await createVasTransaction(req, {
+    sessionId,
+    msisdn,
+    ussdCode,
+    inputText,
+    selectedOption: vasTransaction.selectedOption,
+    flowName: vasTransaction.flowName,
+  });
+  attachVasTransactionFinalizer(req, res, vasTransaction);
+
   if (!msisdn || !sessionId || !ussdCode || typeof text !== 'string') {
     logWithCorrelation(req.correlationId, 'invalid /ussd payload', { sessionId });
+    vasTransaction.status = 'FAILED';
+    vasTransaction.failureReason = 'INVALID_USSD_PAYLOAD';
     return res.status(400).json({ error: 'Invalid ussd request payload' });
   }
 
-  const normalizedText = text.trim();
   const buildFailureQs = (failure) => failure ? `?simulateFailure=${encodeURIComponent(failure)}` : '';
   const crmFailure = ['SUBSCRIBER_NOT_ACTIVE', 'BILLING_FAILED'].includes(simulateFailure) ? null : simulateFailure;
   const ocsFailure = simulateFailure === 'BILLING_FAILED' ? 'billing-500' : simulateFailure;
   const activationFailure = simulateFailure === 'BUNDLE_ACTIVATION_FAILED' ? 'ocs-activation-500' : null;
 
   async function fetchActiveBundles() {
+    vasTransaction.ocsChecked = true;
     logWithCorrelation(req.correlationId, 'calling OCS active bundles', { sessionId, msisdn });
     const activeBundlesResponse = await fetchWithTimeout(
       `http://ocs-service:3004/bundles/${encodeURIComponent(msisdn)}/active`,
@@ -192,6 +609,7 @@ app.post('/ussd', async (req, res) => {
   }
 
   async function refundCharge(chargeData, reason, amount = INTERNET_BUNDLE_PRICE) {
+    vasTransaction.ocsChecked = true;
     logWithCorrelation(req.correlationId, 'calling OCS refund', {
       sessionId,
       msisdn,
@@ -229,11 +647,13 @@ app.post('/ussd', async (req, res) => {
     }
 
     const refundData = await refundResponse.json();
+    vasTransaction.refundReferenceId = refundData.refundReferenceId || vasTransaction.refundReferenceId;
     logWithCorrelation(req.correlationId, 'OCS refund response', { sessionId, status: refundResponse.status, refundStatus: refundData.status });
     return refundData;
   }
 
   async function fetchNewsSubscriptions(category = NEWS_CATEGORY) {
+    vasTransaction.aggregatorChecked = true;
     logWithCorrelation(req.correlationId, 'calling Aggregator subscription lookup', { sessionId, msisdn, category });
     const subscriptionsResponse = await fetchWithTimeout(
       `http://aggregator-service:3006/subscriptions/${encodeURIComponent(msisdn)}?category=${encodeURIComponent(category)}`,
@@ -261,6 +681,7 @@ app.post('/ussd', async (req, res) => {
   }
 
   try {
+    vasTransaction.crmChecked = true;
     logWithCorrelation(req.correlationId, 'calling CRM subscriber lookup', { sessionId, msisdn, simulateFailure });
     const crmResponse = await fetchWithTimeout(
       `http://crm-service:3003/subscribers/${encodeURIComponent(msisdn)}${buildFailureQs(crmFailure)}`,
@@ -289,6 +710,7 @@ app.post('/ussd', async (req, res) => {
     }
 
     const crmData = await crmResponse.json();
+    vasTransaction.subscriberStatus = crmData.status || null;
     logWithCorrelation(req.correlationId, 'CRM response', { sessionId, status: crmData.status, crmData });
 
     if (simulateFailure === 'SUBSCRIBER_NOT_ACTIVE') {
@@ -309,6 +731,7 @@ app.post('/ussd', async (req, res) => {
       return res.json({ sessionId, continueSession: false, message });
     }
 
+    vasTransaction.ocsChecked = true;
     logWithCorrelation(req.correlationId, 'calling OCS balance', { sessionId, msisdn, simulateFailure });
     const ocsResponse = await fetchWithTimeout(
       `http://ocs-service:3004/balance/${encodeURIComponent(msisdn)}${buildFailureQs(ocsFailure)}`,
@@ -408,6 +831,7 @@ app.post('/ussd', async (req, res) => {
       }
 
       const chargeData = await chargeResponse.json();
+      vasTransaction.chargeReferenceId = chargeData.referenceId || vasTransaction.chargeReferenceId;
       logWithCorrelation(req.correlationId, 'OCS news charge response', { sessionId, status: chargeResponse.status, chargeData });
 
       if (chargeData.status !== 'CHARGED') {
@@ -417,6 +841,7 @@ app.post('/ussd', async (req, res) => {
       }
 
       const aggregatorFailure = simulateFailure === 'NEWS_SUBSCRIPTION_FAILED' ? 'aggregator-500' : null;
+      vasTransaction.aggregatorChecked = true;
       logWithCorrelation(req.correlationId, 'calling Aggregator subscription', {
         sessionId,
         msisdn,
@@ -471,6 +896,7 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
+      vasTransaction.smscChecked = true;
       logWithCorrelation(req.correlationId, 'calling SMSC', { sessionId, msisdn, message: `You have subscribed to ${NEWS_OFFER_NAME}.`, simulateFailure });
       const smsResponse = await fetchWithTimeout(
         'http://smsc-service:3005/send-sms',
@@ -583,6 +1009,7 @@ app.post('/ussd', async (req, res) => {
       }
 
       const chargeData = await chargeResponse.json();
+      vasTransaction.chargeReferenceId = chargeData.referenceId || vasTransaction.chargeReferenceId;
       logWithCorrelation(req.correlationId, 'OCS charge response', { sessionId, status: chargeResponse.status, chargeData });
 
       if (chargeData.status !== 'CHARGED') {
@@ -645,6 +1072,7 @@ app.post('/ussd', async (req, res) => {
         return res.json({ sessionId, continueSession: false, message });
       }
 
+      vasTransaction.smscChecked = true;
       logWithCorrelation(req.correlationId, 'calling SMSC', { sessionId, msisdn, message: 'Your 1GB bundle has been activated.', simulateFailure });
       const smsResponse = await fetchWithTimeout(
         'http://smsc-service:3005/send-sms',
@@ -687,11 +1115,25 @@ app.post('/ussd', async (req, res) => {
   } catch (error) {
     console.error(`[vas-platform] [correlationId=${req.correlationId}] error processing ussd`, { sessionId, error: error.message });
     const message = 'Service temporarily unavailable. Please try again later.';
+    vasTransaction.status = 'FAILED';
+    vasTransaction.failureReason = 'UNEXPECTED_ERROR';
+    vasTransaction.customerMessage = message;
     console.log('[vas-platform] final response', { sessionId, message, reason: 'uncaught_error' });
     return res.json({ sessionId, continueSession: false, message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`vas-platform listening on port ${PORT}`);
-});
+async function start() {
+  try {
+    pool = await createPoolWithRetry();
+    await ensureSchema();
+    app.listen(PORT, () => {
+      console.log(`vas-platform listening on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error('[vas-platform] failed to start', { error: error.message });
+    process.exit(1);
+  }
+}
+
+start();

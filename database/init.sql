@@ -114,6 +114,58 @@ CREATE TABLE IF NOT EXISTS sms_attempts (
   INDEX idx_sms_attempts_msisdn_created_at (msisdn, created_at)
 );
 
+CREATE TABLE IF NOT EXISTS gateway_transactions (
+  transaction_id VARCHAR(50) PRIMARY KEY,
+  correlation_id VARCHAR(100),
+  session_id VARCHAR(100),
+  msisdn VARCHAR(20),
+  protocol VARCHAR(50),
+  event_type VARCHAR(50),
+  service_type VARCHAR(50),
+  service_code VARCHAR(50),
+  ussd_code VARCHAR(50),
+  input_text TEXT,
+  destination_platform VARCHAR(100),
+  status VARCHAR(50) NOT NULL,
+  failure_reason VARCHAR(100),
+  error_message TEXT,
+  response_message TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_gateway_transactions_created_at (created_at),
+  INDEX idx_gateway_transactions_correlation_id (correlation_id),
+  INDEX idx_gateway_transactions_msisdn (msisdn),
+  INDEX idx_gateway_transactions_filters (service_type, service_code, status, failure_reason)
+);
+
+CREATE TABLE IF NOT EXISTS vas_transactions (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  correlation_id VARCHAR(100),
+  session_id VARCHAR(100),
+  msisdn VARCHAR(20),
+  ussd_code VARCHAR(50),
+  input_text TEXT,
+  selected_option VARCHAR(20),
+  flow_name VARCHAR(100),
+  subscriber_status VARCHAR(50),
+  status VARCHAR(50) NOT NULL DEFAULT 'IN_PROGRESS',
+  failure_reason VARCHAR(100),
+  customer_message TEXT,
+  crm_checked BOOLEAN NOT NULL DEFAULT FALSE,
+  ocs_checked BOOLEAN NOT NULL DEFAULT FALSE,
+  aggregator_checked BOOLEAN NOT NULL DEFAULT FALSE,
+  smsc_checked BOOLEAN NOT NULL DEFAULT FALSE,
+  charge_reference_id VARCHAR(100),
+  refund_reference_id VARCHAR(100),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_vas_transactions_created_at (created_at),
+  INDEX idx_vas_transactions_correlation_id (correlation_id),
+  INDEX idx_vas_transactions_session_id (session_id),
+  INDEX idx_vas_transactions_msisdn (msisdn),
+  INDEX idx_vas_transactions_status_flow (status, flow_name)
+);
+
 INSERT INTO balances (msisdn, balance) VALUES
   ('0599123456', 10.50),
   ('970599123456', 10.50),
