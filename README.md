@@ -32,8 +32,6 @@ Active services:
 | Aggregator Service | 3006 | Handles third-party/news content subscriptions |
 | MySQL Database | internal 3306 | Stores CRM, OCS, Aggregator, SMSC, Gateway, and VAS operational data |
 
-`billing-service` may still exist in the repository as a legacy/inactive service, but it is not part of the active Docker Compose flow.
-
 ## USSD Menu
 
 ```text
@@ -316,4 +314,3 @@ Key tables:
 - Gateway routing rules are still in application code.
 - Failure simulation flags exist for controlled practice scenarios.
 - Keep correlation IDs in every request when troubleshooting.
-
