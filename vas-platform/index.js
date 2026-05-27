@@ -140,6 +140,14 @@ function getFlowName(normalizedText) {
   return flowNames[normalizedText] || 'MAIN_MENU';
 }
 
+function getAllowedServices(crmData) {
+  return Array.isArray(crmData.allowedServices) ? crmData.allowedServices : [];
+}
+
+function isServiceAllowed(crmData, serviceCode) {
+  return getAllowedServices(crmData).includes(serviceCode);
+}
+
 function inferFailureReason(message, transaction) {
   if (!message) {
     return null;
@@ -729,6 +737,65 @@ app.post('/ussd', async (req, res) => {
       const message = 'Unable to verify subscriber status. Please try again later.';
       console.log('[vas-platform] final response', { sessionId, message });
       return res.json({ sessionId, continueSession: false, message });
+    }
+
+    if (normalizedText === '1') {
+      logWithCorrelation(req.correlationId, 'allowedServices check started', {
+        sessionId,
+        msisdn,
+        requiredService: 'INTERNET_BUNDLE',
+      });
+
+      if (!isServiceAllowed(crmData, 'INTERNET_BUNDLE')) {
+        const message = 'You are not eligible for internet bundle service.';
+        vasTransaction.status = 'FAILED';
+        vasTransaction.failureReason = 'NOT_ELIGIBLE';
+        vasTransaction.customerMessage = message;
+        logWithCorrelation(req.correlationId, 'subscriber not eligible', {
+          sessionId,
+          msisdn,
+          requiredService: 'INTERNET_BUNDLE',
+          allowedServices: getAllowedServices(crmData),
+        });
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'not_eligible' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      logWithCorrelation(req.correlationId, 'subscriber eligible', {
+        sessionId,
+        msisdn,
+        requiredService: 'INTERNET_BUNDLE',
+      });
+    }
+
+    if (normalizedText === '3') {
+      logWithCorrelation(req.correlationId, 'allowedServices check started', {
+        sessionId,
+        msisdn,
+        requiredService: NEWS_CATEGORY,
+      });
+
+      if (!isServiceAllowed(crmData, NEWS_CATEGORY)) {
+        const message = 'You are not eligible for news alerts service.';
+        vasTransaction.flowName = 'SUBSCRIBE_NEWS';
+        vasTransaction.status = 'FAILED';
+        vasTransaction.failureReason = 'NOT_ELIGIBLE';
+        vasTransaction.customerMessage = message;
+        logWithCorrelation(req.correlationId, 'subscriber not eligible', {
+          sessionId,
+          msisdn,
+          requiredService: NEWS_CATEGORY,
+          allowedServices: getAllowedServices(crmData),
+        });
+        console.log('[vas-platform] final response', { sessionId, message, reason: 'not_eligible' });
+        return res.json({ sessionId, continueSession: false, message });
+      }
+
+      logWithCorrelation(req.correlationId, 'subscriber eligible', {
+        sessionId,
+        msisdn,
+        requiredService: NEWS_CATEGORY,
+      });
     }
 
     vasTransaction.ocsChecked = true;
